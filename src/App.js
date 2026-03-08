@@ -1,14 +1,13 @@
 import React, { useState, useEffect } from "react";
 import { BrowserRouter as Router, Routes, Route, Link, useNavigate, useLocation } from "react-router-dom";
 import { loadStripe } from "@stripe/stripe-js";
-import Signup from './Signup';
+import { Elements, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
 
 // --- 1. STRIPE INITIALIZATION ---
-// Use your Test Publishable Key here. Avoid using pk_live during development.
-const stripePromise = loadStripe("pk_test_INSERT_YOUR_TEST_PUBLISHABLE_KEY_HERE");
+const stripePromise = loadStripe("pk_live_xmALuYHH9tmQVPDqRcgcPb2b00Jv7yg0cj");
 
 // --- 2. BACKEND CONFIGURATION ---
-const BACKEND_URL = "http://localhost:4242";
+const BACKEND_URL = "https://hair-backend-2.onrender.com";
 
 // --- 3. UI HELPERS ---
 const ScrollToTop = () => {
@@ -18,7 +17,15 @@ const ScrollToTop = () => {
 };
 
 // --- 4. STRIPE UI CONFIGURATION ---
-// (Removed for hosted checkout)
+const appearance = {
+  theme: 'flat',
+  variables: { colorPrimaryText: '#262626' }
+};
+
+const paymentElementOptions = {
+  layout: { type: 'accordion', defaultCollapsed: false, radios: 'always', spacedAccordionItems: false },
+  business: { name: "Majority Hair Solutions" }
+};
 
 const productsData = {
   shampoos: [
@@ -76,6 +83,45 @@ const ProfilePage = ({ userEmail, savedSets }) => (
     </section>
   </div>
 );
+
+// --- STRIPE CHECKOUT COMPONENT ---
+const CheckoutForm = ({ totalPrice, onPurchaseSuccess }) => {
+  const stripe = useStripe();
+  const elements = useElements();
+  const [errorMessage, setErrorMessage] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    if (!stripe || !elements) return;
+    setIsProcessing(true);
+
+    const { error } = await stripe.confirmPayment({
+      elements,
+      confirmParams: {
+        return_url: `${window.location.origin}/orders`,
+      },
+      redirect: 'if_required' // For demo purposes, we handle the success logic below if no redirect happens
+    });
+
+    if (error) {
+      setErrorMessage(error.message);
+      setIsProcessing(false);
+    } else {
+      onPurchaseSuccess();
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <PaymentElement options={paymentElementOptions} />
+      <button disabled={!stripe || isProcessing} style={{ ...styles.authButton, marginTop: '20px' }}>
+        {isProcessing ? "Processing..." : `Complete Purchase ($${totalPrice})`}
+      </button>
+      {errorMessage && <div style={{ color: 'red', marginTop: '10px', fontSize: '12px' }}>{errorMessage}</div>}
+    </form>
+  );
+};
 
 // --- AUTH COMPONENTS ---
 const LoginPage = ({ onLogin }) => {
@@ -141,10 +187,12 @@ const SignupPage = () => {
 };
 
 // --- LANDING PAGE ---
-function LandingPage({ saveSetToProfile, userEmail }) {
+function LandingPage({ saveSetToProfile }) {
   const navigate = useNavigate();
   const [selection, setSelection] = useState({ shampoo1: null, shampoo2: null, conditioner1: null, conditioner2: null, oil1: null, oil2: null });
   const [focusedItem, setFocusedItem] = useState(null);
+  const [clientSecret, setClientSecret] = useState("");
+  const [price, setPrice] = useState(0);
 
   const handleSelect = (slot, item) => {
     setFocusedItem(item);
@@ -154,30 +202,22 @@ function LandingPage({ saveSetToProfile, userEmail }) {
   const selectedItems = Object.values(selection).filter(Boolean);
   const isSetComplete = selectedItems.length === 6;
 
-  const handleCheckout = async (type) => {
-    let email = userEmail;
-    if (type === 'subscription' && !userEmail) {
-      alert("Please log in to subscribe.");
-      navigate("/login");
-      return;
-    }
-    if (type === 'one-time' && !userEmail) {
-      email = prompt("Please enter your email for the purchase:");
-      if (!email) return;
-    }
+  const initializePayment = async (amt) => {
+    setPrice(amt);
     try {
-      const response = await fetch(`${BACKEND_URL}/create-checkout-session`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items: selectedItems, email, type })
+      const response = await fetch(`${BACKEND_URL}/api/create-payment-intent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ amount: Math.round(amt * 100) }), 
       });
-      const { id } = await response.json();
-      const stripe = await stripePromise;
-      await stripe.redirectToCheckout({ sessionId: id });
-    } catch (err) {
-      console.error("Checkout error:", err);
-      alert("Checkout failed. Please try again.");
-    }
+      const data = await response.json();
+      if (data.clientSecret) setClientSecret(data.clientSecret);
+    } catch (err) { alert("Payment initialization failed."); }
+  };
+
+  const onPurchaseSuccess = () => {
+    saveSetToProfile(selectedItems);
+    navigate("/orders");
   };
 
   const renderRow = (label, slot, category) => (
@@ -216,8 +256,17 @@ function LandingPage({ saveSetToProfile, userEmail }) {
           <div style={{ margin: '10px 0' }}>{selectedItems.map((item, idx) => (<p key={idx} style={{ fontSize: '11px', margin: '4px 0' }}>✓ {item.name}</p>))}</div>
           {isSetComplete ? (
             <div style={{ borderTop: '2px solid #222', paddingTop: '15px' }}>
-              <button style={styles.checkoutBtn} onClick={() => handleCheckout('one-time')}>Checkout One-Time ($24.99)</button>
-              <button style={{ ...styles.checkoutBtn, background: '#222', color: '#fff' }} onClick={() => handleCheckout('subscription')}>Subscribe ($19.99/mo)</button>
+              {!clientSecret ? (
+                <>
+                  <button style={styles.checkoutBtn} onClick={() => initializePayment(19.99)}>Checkout One-Time ($19.99)</button>
+                  <button style={{ ...styles.checkoutBtn, background: '#222', color: '#fff' }} onClick={() => initializePayment(15.99)}>Subscribe ($15.99/mo)</button>
+                </>
+              ) : (
+                <Elements stripe={stripePromise} options={{ clientSecret, appearance }}>
+                  <CheckoutForm totalPrice={price} onPurchaseSuccess={onPurchaseSuccess} />
+                  <button onClick={() => setClientSecret("")} style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', fontSize: '11px', marginTop: '10px' }}>← Change Plan</button>
+                </Elements>
+              )}
             </div>
           ) : <p style={{ fontSize: '12px', color: '#888' }}>Select 6 products to checkout</p>}
         </div>
@@ -278,7 +327,7 @@ const LegislaturePage = ({ items }) => (
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [userEmail, setUserEmail] = useState("");
-  const [savedSets, setSavedSets] = useState([]); 
+  const [savedSets, setSavedSets] = useState([]); // User's purchased sets
   const [legislatureItems, setLegislatureItems] = useState([
     { id: 1, type: "Partner", company: "EcoHair Labs", product: "Silk Serum", desc: "Organic serum for hair." }
   ]);
@@ -342,7 +391,7 @@ export default function App() {
         </header>
 
         <Routes>
-          <Route path="/" element={<LandingPage saveSetToProfile={saveSetToProfile} userEmail={userEmail} />} />
+          <Route path="/" element={<LandingPage saveSetToProfile={saveSetToProfile} />} />
           <Route path="/login" element={<LoginPage onLogin={handleLoginSuccess} />} />
           <Route path="/signup" element={<SignupPage />} />
           <Route path="/recommend" element={<RecommendPage addLegislatureItem={addLegislatureItem} />} />
