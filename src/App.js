@@ -65,14 +65,14 @@ const isPolitburoOrHigher = (score) => score >= 12000000;
 // --- CALCULATE POINTS TO NEXT RANK ---
 const getPointsToNextRank = (currentScore, currentRankTitle) => {
   const currentIndex = RANK_TIERS.findIndex(r => r.title === currentRankTitle);
-  if (currentIndex === 0) return 0;
+  if (currentIndex <= 0) return 0;
   const nextRank = RANK_TIERS[currentIndex - 1];
   return Math.max(0, nextRank.min - currentScore);
 };
 
 const getNextRankTitle = (currentRankTitle) => {
   const currentIndex = RANK_TIERS.findIndex(r => r.title === currentRankTitle);
-  if (currentIndex === 0) return null;
+  if (currentIndex <= 0) return null;
   return RANK_TIERS[currentIndex - 1].title;
 };
 
