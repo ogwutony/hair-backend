@@ -22,9 +22,18 @@ app.use(express.json());
 
 // CORS Configuration - Allows multiple origins
 const allowedOrigins = [
-  'https://majorityhairsolutions.com',
-  'https://www.majorityhairsolutions.com',
-  'http://localhost:3000' // For local development
+    'https://themajorities.com',
+    'https://www.themajorities.com',
+    'https://majorityhairsolutions.com',
+    'https://www.majorityhairsolutions.com',
+    'https://themajority.com',
+    'https://www.themajority.com',
+    'https://themajoritysolutions.com',
+    'https://themajorityfacesolution.com',
+    'https://www.themajorityfacesolution.com',
+    'https://themajoritiessolution.com',
+    'https://www.themajoritiessolution.com',
+    'http://localhost:3000' // For local developmenth
 ];
 
 app.use(cors({
@@ -296,7 +305,7 @@ const sendRankUpEmail = async (user, newRankTitle) => {
   if (user.rank_rewards_sent.includes(newRankTitle)) return; // Prevent double-dip
 
   const range = getRankRange(newRankTitle);
-  const shopUrl = process.env.FRONTEND_URL || 'https://majorityhairsolutions.com';
+  const shopUrl = process.env.FRONTEND_URL || 'https://themajorities.com';
 
   const html = `
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 30px;">
@@ -568,7 +577,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     user.resetTokenExpiry = new Date(Date.now() + 3600000); // 1 hour
     await user.save();
 
-    const frontendUrl = process.env.FRONTEND_URL || 'https://majorityhairsolutions.com';
+    const frontendUrl = process.env.FRONTEND_URL || 'https://themajorities.com';
     const resetUrl = `${frontendUrl}/reset-password/${rawToken}`;
 
     await sendEmail(user.email, 'Reset Your Password', `<p>Click <a href="${resetUrl}">here</a> to reset your password.</p>`);
