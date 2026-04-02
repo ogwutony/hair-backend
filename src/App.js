@@ -173,6 +173,24 @@ const productsData = {
     { name: "Scalp Oil", desc: "Soothes dry scalp." },
     { name: "Light Oil", desc: "Weightless daily oil." },
     { name: "Nourish Oil", desc: "Deep nourishment." }
+  ],
+  faceScrubs: [
+    { name: "Exfoliating Scrub", desc: "Removes dead skin cells for a fresh glow." },
+    { name: "Brightening Scrub", desc: "Evens skin tone and adds radiance." },
+    { name: "Detox Scrub", desc: "Deep-cleanses pores and purifies skin." },
+    { name: "Gentle Scrub", desc: "Mild daily exfoliation for sensitive skin." }
+  ],
+  toners: [
+    { name: "Balancing Toner", desc: "Restores skin's natural pH balance." },
+    { name: "Hydrating Toner", desc: "Boosts moisture before moisturizer." },
+    { name: "Clarifying Toner", desc: "Minimizes pores and controls oil." },
+    { name: "Soothing Toner", desc: "Calms irritation and redness." }
+  ],
+  faceCreams: [
+    { name: "Hydrating Cream", desc: "Intense moisture for dry skin." },
+    { name: "Repair Cream", desc: "Rebuilds and restores the skin barrier." },
+    { name: "Brightening Cream", desc: "Fades dark spots and evens tone." },
+    { name: "Firming Cream", desc: "Lifts and tightens for a youthful look." }
   ]
 };
 
@@ -609,18 +627,25 @@ const SignupPage = () => {
 // --- LANDING PAGE ---
 function LandingPage({ saveSetToProfile, onAddPoints, savedSets }) {
   const navigate = useNavigate();
-  const [selection, setSelection] = useState({ shampoo1: null, shampoo2: null, conditioner1: null, conditioner2: null, oil1: null, oil2: null });
+  const [selection, setSelection] = useState([]);
   const [focusedItem, setFocusedItem] = useState(null);
   const [clientSecret, setClientSecret] = useState("");
   const [price, setPrice] = useState(0);
   const [purchaseType, setPurchaseType] = useState(null); // "one-time" or "subscription"
-  
-  const handleSelect = (slot, item) => {
+
+  const handleSelect = (item) => {
     setFocusedItem(item);
-    setSelection(prev => ({ ...prev, [slot]: prev[slot]?.name === item.name ? null : item }));
+    setSelection(prev => {
+      const existingIndex = prev.findIndex(s => s._key === item._key);
+      if (existingIndex >= 0) {
+        return prev.filter((_, i) => i !== existingIndex);
+      }
+      if (prev.length >= 6) return prev;
+      return [...prev, item];
+    });
   };
-  
-  const selectedItems = Object.values(selection).filter(Boolean);
+
+  const selectedItems = selection;
   const isSetComplete = selectedItems.length === 6;
   
   // Calculate points based on purchase type
@@ -658,14 +683,16 @@ function LandingPage({ saveSetToProfile, onAddPoints, savedSets }) {
     navigate("/orders");
   };
   
-  const renderRow = (label, slot, category) => (
+  const renderRow = (label, category) => (
     <div style={styles.rowSection}>
       <h3 style={styles.rowLabel}>{label}</h3>
       <div style={styles.scrollRow}>
         {productsData[category].map(item => {
-          const isSelected = selection[slot]?.name === item.name;
+          const keyedItem = { ...item, _key: `${category}:${item.name}` };
+          const isSelected = selection.some(s => s._key === keyedItem._key);
+          const isDisabled = !isSelected && selection.length >= 6;
           return (
-            <div key={item.name} onClick={() => handleSelect(slot, item)} style={{ ...styles.card, border: isSelected ? "2px solid #222" : "1px solid #eee" }}>
+            <div key={keyedItem._key} onClick={() => !isDisabled && handleSelect(keyedItem)} style={{ ...styles.card, border: isSelected ? "2px solid #222" : "1px solid #eee", opacity: isDisabled ? 0.4 : 1, cursor: isDisabled ? 'not-allowed' : 'pointer' }}>
               <div style={styles.imagePlaceholder}>{item.name[0]}</div>
               <div style={styles.itemName}>{item.name}</div>
             </div>
@@ -678,12 +705,12 @@ function LandingPage({ saveSetToProfile, onAddPoints, savedSets }) {
   return (
     <div style={styles.layout}>
       <div style={styles.left}>
-        {renderRow("Pick Shampoo 1", "shampoo1", "shampoos")}
-        {renderRow("Pick Shampoo 2", "shampoo2", "shampoos")}
-        {renderRow("Pick Conditioner 1", "conditioner1", "conditioners")}
-        {renderRow("Pick Conditioner 2", "conditioner2", "conditioners")}
-        {renderRow("Pick Oil 1", "oil1", "oils")}
-        {renderRow("Pick Oil 2", "oil2", "oils")}
+        {renderRow("Pick Shampoos", "shampoos")}
+        {renderRow("Pick Conditioners", "conditioners")}
+        {renderRow("Pick Oils", "oils")}
+        {renderRow("Pick Face Scrubs", "faceScrubs")}
+        {renderRow("Pick Toners", "toners")}
+        {renderRow("Pick Face Creams", "faceCreams")}
       </div>
       <aside style={styles.right}>
         <div style={{ minHeight: '100px', marginBottom: '15px' }}>
