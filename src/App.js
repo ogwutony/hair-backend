@@ -1434,7 +1434,7 @@ const CultureLabPage = ({ addDumaItem, userEmail, rankTitle, rankScore, authToke
       setVideoUploading(false);
       setSubmitted(true);
     } catch (err) {
-      // Fallback: local only
+      // Fallback: local only (server was unreachable — treat as text submission)
       addDumaItem({
         id: Date.now(),
         type: "Culture",
@@ -1445,7 +1445,7 @@ const CultureLabPage = ({ addDumaItem, userEmail, rankTitle, rankScore, authToke
         submitterRank: rankTitle || 'bolshevik',
         votes: { yes: 0 }
       });
-      if (onAddPoints) onAddPoints(uploadedVideoUrl ? 100 : 1);
+      if (onAddPoints) onAddPoints(1);
       setPublishSaveStatus("saved");
       setVideoUploading(false);
       setSubmitted(true);
@@ -1454,14 +1454,26 @@ const CultureLabPage = ({ addDumaItem, userEmail, rankTitle, rankScore, authToke
 
   const handleShareToSocial = (platform) => {
     if (!publishedVideoUrl) return;
-    const text = encodeURIComponent(`${response} — Watch my perspective on The Majority`);
-    const url = encodeURIComponent(publishedVideoUrl);
-    const shareUrls = {
-      instagram: `https://www.instagram.com/`,      // Instagram doesn't support web share URLs for video; open app
-      tiktok: `https://www.tiktok.com/upload`,       // TikTok upload page
-      facebook: `https://www.facebook.com/sharer/sharer.php?u=${url}&quote=${text}`
-    };
-    window.open(shareUrls[platform], '_blank', 'noopener,noreferrer');
+    const shareText = `${response} — Watch my perspective on The Majority`;
+    const shareUrl = publishedVideoUrl;
+
+    // Use native Web Share API if available (mobile)
+    if (platform === 'instagram' || platform === 'tiktok') {
+      if (navigator.share) {
+        navigator.share({ title: 'My Perspective', text: shareText, url: shareUrl }).catch(() => {});
+      } else {
+        // Copy link to clipboard as fallback for platforms without direct URL schemes
+        navigator.clipboard.writeText(`${shareText}\n${shareUrl}`).then(() => {
+          alert(`Link copied to clipboard! Open ${platform === 'instagram' ? 'Instagram' : 'TikTok'} and paste it in your post or story.`);
+        }).catch(() => {
+          alert(`Copy this link to share on ${platform === 'instagram' ? 'Instagram' : 'TikTok'}:\n${shareUrl}`);
+        });
+      }
+      return;
+    }
+
+    const facebookUrl = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(shareUrl)}&quote=${encodeURIComponent(shareText)}`;
+    window.open(facebookUrl, '_blank', 'noopener,noreferrer');
   };
 
   if (submitted) {

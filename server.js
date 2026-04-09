@@ -881,7 +881,7 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
     
     const { file } = req;
     const isImage = file.mimetype.startsWith('image');
-    const isVideo = file.mimetype.startsWith('video') || file.mimetype === 'video/quicktime';
+    const isVideo = file.mimetype.startsWith('video');
     
     if (!isImage && !isVideo) {
       return res.status(400).json({ error: 'Only images and videos allowed' });
