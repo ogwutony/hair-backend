@@ -57,7 +57,7 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 52428800 }, // 50MB
   fileFilter: (req, file, cb) => {
-    const allowedMimes = ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/webm'];
+    const allowedMimes = ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/webm', 'video/quicktime'];
     if (allowedMimes.includes(file.mimetype)) {
       cb(null, true);
     } else {
@@ -197,6 +197,7 @@ const userSchema = new mongoose.Schema({
   rank_score:       { type: Number, default: 1 },   // BigInt-scale (up to 10,000,000)
   rank_title:       { type: String, default: 'bolshevik' },
   rank_rewards_sent: { type: [String], default: [] }, // Track which ranks already rewarded
+  avatarUrl: { type: String, default: null }, // Profile avatar image URL
   
   // Profile perspectives (4-box layout)
   perspective: {
@@ -227,12 +228,17 @@ const Order = mongoose.model('Order', new mongoose.Schema({
 
 // Duma (formerly Legislature) submissions
 const DumaItem = mongoose.model('DumaItem', new mongoose.Schema({
-  type:       { type: String, required: true }, // "Recommendation" | "Partner"
+  type:       { type: String, required: true }, // "Recommendation" | "Partner" | "Culture"
+  category:   String,
   company:    String,
   product:    String,
   name:       String,
   reason:     String,
   desc:       String,
+  prompt:     String,
+  response:   String,
+  videoUrl:   String, // Culture video URL
+  perspective: String, // Culture video description/perspective
   submittedBy: String,
   submitterRank: String,
   votes:      { yay: { type: Number, default: 0 }, nay: { type: Number, default: 0 } },
@@ -721,6 +727,40 @@ app.post('/api/duma/partner', authMiddleware, async (req, res) => {
   }
 });
 
+// 5. Submit culture video/perspective to Duma
+app.post('/api/duma/culture', authMiddleware, async (req, res) => {
+  try {
+    const { prompt, response, videoUrl, perspective, category } = req.body;
+    const rankTitle = req.user.rank_title || getRankTitle(req.user.rank_score || 1);
+    const isVideoSubmission = Boolean(videoUrl);
+
+    const item = await DumaItem.create({
+      type: 'Culture',
+      category: category || 'Culture',
+      prompt,
+      response,
+      videoUrl: videoUrl || null,
+      perspective: perspective || response,
+      submittedBy: req.user.email,
+      submitterRank: rankTitle
+    });
+
+    // Award +100 pts for video submissions, +1 pt for text-only
+    const pointsToAward = isVideoSubmission ? 100 : 1;
+    await updateRankScore(req.user._id, pointsToAward);
+
+    res.status(201).json({
+      message: isVideoSubmission
+        ? "Culture video published to the Duma! +100 points awarded."
+        : "Perspective shared to the Duma! +1 point awarded.",
+      item,
+      pointsAwarded: pointsToAward
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET user rank info
 app.get('/api/rank', authMiddleware, async (req, res) => {
   const user = req.user;
@@ -748,6 +788,7 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
         box4: { content: "", mediaUrls: [], videoUrl: null }
       },
       socialLinks: user.socialLinks || { instagram: "", tiktok: "", facebook: "" },
+      avatarUrl: user.avatarUrl || null,
       _id: user._id
     });
   } catch (err) {
@@ -799,6 +840,31 @@ app.put('/api/profile/social-links', authMiddleware, async (req, res) => {
     );
     
     res.json({ success: true, message: 'Social links updated', socialLinks: user.socialLinks });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/profile/avatar - Set avatar URL after a successful media upload
+app.put('/api/profile/avatar', authMiddleware, async (req, res) => {
+  try {
+    const { avatarUrl } = req.body;
+    if (!avatarUrl) return res.status(400).json({ error: 'avatarUrl is required' });
+    await User.findByIdAndUpdate(req.user._id, { avatarUrl });
+    res.json({ success: true, avatarUrl });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/profile/add-points - Add points to user rank score
+app.post('/api/profile/add-points', authMiddleware, async (req, res) => {
+  try {
+    const { points } = req.body;
+    if (!points || typeof points !== 'number') return res.status(400).json({ error: 'points must be a number' });
+    await updateRankScore(req.user._id, points);
+    const user = await User.findById(req.user._id);
+    res.json({ success: true, rank_score: user.rank_score, rank_title: user.rank_title });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
