@@ -7,11 +7,21 @@ const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const axios = require('axios');
 const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
 require('dotenv').config();
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 // Validate critical environment variables
 if (!process.env.STRIPE_SECRET_KEY) {
   console.warn("⚠️ WARNING: STRIPE_SECRET_KEY is not defined in .env");
+}
+if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+  console.warn("⚠️ WARNING: One or more CLOUDINARY_* environment variables are not defined. Media uploads will fail.");
 }
 
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -41,7 +51,8 @@ app.use(cors({
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
     
-    if (allowedOrigins.indexOf(origin) === -1) {
+    // Allow any *.vercel.app subdomain to support all Vercel preview deployments
+    if (allowedOrigins.indexOf(origin) === -1 && !/\.vercel\.app$/.test(origin)) {
       const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
       return callback(new Error(msg), false);
     }
@@ -895,8 +906,18 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
       return res.status(400).json({ error: 'Video must be under 50MB' });
     }
     
-    // TODO: Upload to S3/Cloudinary and get actual storageUrl
-    // For now: create placeholder URL
+    // Upload buffer to Cloudinary via stream
+    const cloudinaryResult = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { resource_type: isVideo ? 'video' : 'image', folder: 'majority-hair' },
+        (error, result) => {
+          if (error) return reject(new Error('Failed to upload media to Cloudinary: ' + error.message));
+          resolve(result);
+        }
+      );
+      uploadStream.end(file.buffer);
+    });
+
     const media = await Media.create({
       userId: req.user._id,
       filename: file.originalname,
@@ -904,7 +925,7 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
       mimetype: file.mimetype,
       size: file.size,
       type: isImage ? 'image' : 'video',
-      storageUrl: `${process.env.CDN_URL || 'https://cdn.majority-hair.com'}/media/${Date.now()}-${file.originalname}`,
+      storageUrl: cloudinaryResult.secure_url,
       uploadedAt: new Date()
     });
     
