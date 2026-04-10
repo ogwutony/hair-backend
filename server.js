@@ -7,7 +7,16 @@ const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const axios = require('axios');
 const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
+const { Readable } = require('stream');
 require('dotenv').config();
+
+// Cloudinary Configuration
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 // Validate critical environment variables
 if (!process.env.STRIPE_SECRET_KEY) {
@@ -33,19 +42,25 @@ const allowedOrigins = [
     'https://www.themajorityfacesolution.com',
     'https://themajoritiessolution.com',
     'https://www.themajoritiessolution.com',
-    'http://localhost:3000' // For local developmenth
+    'https://hair-frontend-2.vercel.app',
+    /https:\/\/majority-hair-frontend-.*\.vercel\.app$/, // Regex for Vercel preview URLs
+    'http://localhost:3000' // For local development
 ];
 
 app.use(cors({
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.indexOf(origin) === -1) {
-      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
-      return callback(new Error(msg), false);
+
+    const isAllowed = allowedOrigins.some((pattern) => {
+      return pattern instanceof RegExp ? pattern.test(origin) : pattern === origin;
+    });
+
+    if (isAllowed) {
+      return callback(null, true);
+    } else {
+      return callback(new Error('Not allowed by CORS'), false);
     }
-    return callback(null, true);
   },
   credentials: true, // Required if you are sending cookies or Authorization headers
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -894,9 +909,24 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
     if (isVideo && file.size > 52428800) { // 50MB
       return res.status(400).json({ error: 'Video must be under 50MB' });
     }
-    
-    // TODO: Upload to S3/Cloudinary and get actual storageUrl
-    // For now: create placeholder URL
+
+    // Upload buffer to Cloudinary using a stream
+    const uploadToCloudinary = (buffer) => {
+      return new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { folder: 'user_media', resource_type: 'auto' },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result);
+          }
+        );
+        Readable.from(buffer).pipe(stream);
+      });
+    };
+
+    const cloudinaryResult = await uploadToCloudinary(file.buffer);
+    const storageUrl = cloudinaryResult.secure_url;
+
     const media = await Media.create({
       userId: req.user._id,
       filename: file.originalname,
@@ -904,7 +934,7 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
       mimetype: file.mimetype,
       size: file.size,
       type: isImage ? 'image' : 'video',
-      storageUrl: `${process.env.CDN_URL || 'https://cdn.majority-hair.com'}/media/${Date.now()}-${file.originalname}`,
+      storageUrl,
       uploadedAt: new Date()
     });
     
@@ -920,7 +950,8 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
       uploadedAt: media.uploadedAt
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Upload Error:", err);
+    res.status(500).json({ error: 'Cloudinary upload failed' });
   }
 });
 
