@@ -18,6 +18,20 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
+// Upload a buffer to Cloudinary using a stream
+const uploadToCloudinary = (buffer) => {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder: 'user_media', resource_type: 'auto' },
+      (error, result) => {
+        if (error) reject(error);
+        else resolve(result);
+      }
+    );
+    Readable.from(buffer).pipe(stream);
+  });
+};
+
 // Validate critical environment variables
 if (!process.env.STRIPE_SECRET_KEY) {
   console.warn("⚠️ WARNING: STRIPE_SECRET_KEY is not defined in .env");
@@ -43,7 +57,7 @@ const allowedOrigins = [
     'https://themajoritiessolution.com',
     'https://www.themajoritiessolution.com',
     'https://hair-frontend-2.vercel.app',
-    /https:\/\/majority-hair-frontend-.*\.vercel\.app$/, // Regex for Vercel preview URLs
+    /^https:\/\/majority-hair-frontend-[a-z0-9-]+\.vercel\.app$/, // Regex for Vercel preview URLs
     'http://localhost:3000' // For local development
 ];
 
@@ -909,20 +923,6 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
     if (isVideo && file.size > 52428800) { // 50MB
       return res.status(400).json({ error: 'Video must be under 50MB' });
     }
-
-    // Upload buffer to Cloudinary using a stream
-    const uploadToCloudinary = (buffer) => {
-      return new Promise((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          { folder: 'user_media', resource_type: 'auto' },
-          (error, result) => {
-            if (error) reject(error);
-            else resolve(result);
-          }
-        );
-        Readable.from(buffer).pipe(stream);
-      });
-    };
 
     const cloudinaryResult = await uploadToCloudinary(file.buffer);
     const storageUrl = cloudinaryResult.secure_url;
