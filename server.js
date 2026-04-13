@@ -740,9 +740,8 @@ app.get('/api/duma', async (req, res) => {
         if (key && !seen.has(key)) {
           seen.add(key);
           deduped.push(item);
-        } else if (!key) {
-          deduped.push(item); // keep items without a submitter key as-is
         }
+        // Items without a submitter are excluded from the deduplicated community grid
       }
       return res.json(deduped);
     }
@@ -966,7 +965,7 @@ app.put('/api/profile/avatar', authMiddleware, async (req, res) => {
     if (!avatarUrl || typeof avatarUrl !== 'string') return res.status(400).json({ error: 'avatarUrl is required' });
     // Basic URL validation to prevent storing arbitrary values
     let parsedUrl;
-    try { parsedUrl = new URL(avatarUrl); } catch { return res.status(400).json({ error: 'avatarUrl must be a valid URL' }); }
+    try { parsedUrl = new URL(avatarUrl); } catch (urlErr) { return res.status(400).json({ error: 'avatarUrl must be a valid URL' }); }
     if (!['https:', 'http:'].includes(parsedUrl.protocol)) return res.status(400).json({ error: 'avatarUrl must use http or https' });
     await User.findByIdAndUpdate(req.user._id, { avatarUrl, profilePictureUrl: avatarUrl });
     res.json({ success: true, avatarUrl });
