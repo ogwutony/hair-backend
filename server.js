@@ -95,6 +95,20 @@ const upload = multer({
   }
 });
 
+// Avatar-specific upload: JPG/PNG only, 5MB max
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5242880 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    const allowedMimes = ['image/jpeg', 'image/png'];
+    if (allowedMimes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only JPG and PNG images are allowed for profile pictures'));
+    }
+  }
+});
+
 // --- DATABASE ---
 const MONGODB_URI = process.env.MONGODB_URI;
 if (MONGODB_URI) {
@@ -227,6 +241,7 @@ const userSchema = new mongoose.Schema({
   rank_title:       { type: String, default: 'bolshevik' },
   rank_rewards_sent: { type: [String], default: [] }, // Track which ranks already rewarded
   avatarUrl: { type: String, default: null }, // Profile avatar image URL
+  profilePictureUrl: { type: String, default: null }, // Profile picture URL (canonical)
   
   // Profile perspectives (4-box layout)
   perspective: {
@@ -270,6 +285,13 @@ const DumaItem = mongoose.model('DumaItem', new mongoose.Schema({
   perspective: String, // Culture video description/perspective
   submittedBy: String,
   submitterRank: String,
+  submitterId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // Reference to submitting user
+  submitterProfilePictureUrl: String, // Denormalized for fast Culture feed lookups
+  submitterSocialLinks: {              // Denormalized for fast Culture feed lookups
+    instagram: String,
+    tiktok: String,
+    facebook: String
+  },
   votes:      { yay: { type: Number, default: 0 }, nay: { type: Number, default: 0 } },
   createdAt:  { type: Date, default: Date.now }
 }));
@@ -385,6 +407,15 @@ const updateRankScore = async (userId, pointsToAdd) => {
 };
 
 // --- ROUTES ---
+
+// Allowed Duma item types for safe query filtering
+const ALLOWED_DUMA_TYPES = new Set(['Recommendation', 'Partner', 'Culture']);
+
+// Helper: resolve the canonical profile picture URL for a user document
+const resolveProfilePictureUrl = (user) => user.profilePictureUrl || user.avatarUrl || null;
+
+// Default social links object
+const DEFAULT_SOCIAL_LINKS = { instagram: '', tiktok: '', facebook: '' };
 
 // Health check
 app.get('/', (req, res) => res.send('The Majority Backend is Live!'));
@@ -671,8 +702,51 @@ app.post('/api/create-payment-intent', async (req, res) => {
 // 1. Fetch all submissions
 app.get('/api/duma', async (req, res) => {
   try {
-    const items = await DumaItem.find().sort({ createdAt: -1 });
-    res.json(items);
+    const { type, deduplicate } = req.query;
+
+    // Whitelist the type value to prevent NoSQL injection
+    const query = (type && ALLOWED_DUMA_TYPES.has(type)) ? { type } : {};
+    const items = await DumaItem.find(query).sort({ createdAt: -1 });
+
+    // Enrich items with up-to-date submitter profile data
+    const submitterEmails = [...new Set(items.map(i => i.submittedBy).filter(Boolean))];
+    const submitters = await User.find(
+      { email: { $in: submitterEmails } },
+      'email profilePictureUrl avatarUrl socialLinks'
+    );
+    const submitterMap = {};
+    for (const u of submitters) {
+      submitterMap[u.email] = {
+        profilePictureUrl: resolveProfilePictureUrl(u),
+        socialLinks: u.socialLinks || DEFAULT_SOCIAL_LINKS
+      };
+    }
+
+    const enriched = items.map(item => {
+      const profile = submitterMap[item.submittedBy] || {};
+      return {
+        ...item.toObject(),
+        submitterProfilePictureUrl: profile.profilePictureUrl || item.submitterProfilePictureUrl || null,
+        submitterSocialLinks: profile.socialLinks || item.submitterSocialLinks || DEFAULT_SOCIAL_LINKS
+      };
+    });
+
+    // De-duplicate by submittedBy email — keep only the most recent item per user
+    if (deduplicate === 'true') {
+      const seen = new Set();
+      const deduped = [];
+      for (const item of enriched) {
+        const key = item.submittedBy || null;
+        if (key && !seen.has(key)) {
+          seen.add(key);
+          deduped.push(item);
+        }
+        // Items without a submitter are excluded from the deduplicated community grid
+      }
+      return res.json(deduped);
+    }
+
+    res.json(enriched);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -715,7 +789,10 @@ app.post('/api/duma/recommend', authMiddleware, async (req, res) => {
       company,
       reason,
       submittedBy: req.user.email,
-      submitterRank: rankTitle
+      submitterRank: rankTitle,
+      submitterId: req.user._id,
+      submitterProfilePictureUrl: resolveProfilePictureUrl(req.user),
+      submitterSocialLinks: req.user.socialLinks || DEFAULT_SOCIAL_LINKS
     });
 
     await updateRankScore(req.user._id, 5);
@@ -746,7 +823,10 @@ app.post('/api/duma/partner', authMiddleware, async (req, res) => {
       product,
       desc,
       submittedBy: req.user.email,
-      submitterRank: rankTitle
+      submitterRank: rankTitle,
+      submitterId: req.user._id,
+      submitterProfilePictureUrl: resolveProfilePictureUrl(req.user),
+      submitterSocialLinks: req.user.socialLinks || DEFAULT_SOCIAL_LINKS
     });
 
     await updateRankScore(req.user._id, 10);
@@ -771,7 +851,10 @@ app.post('/api/duma/culture', authMiddleware, async (req, res) => {
       videoUrl: videoUrl || null,
       perspective: perspective || response,
       submittedBy: req.user.email,
-      submitterRank: rankTitle
+      submitterRank: rankTitle,
+      submitterId: req.user._id,
+      submitterProfilePictureUrl: resolveProfilePictureUrl(req.user),
+      submitterSocialLinks: req.user.socialLinks || DEFAULT_SOCIAL_LINKS
     });
 
     // Award +100 pts for video submissions, +1 pt for text-only
@@ -816,8 +899,9 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
         box3: { content: "", mediaUrls: [], videoUrl: null },
         box4: { content: "", mediaUrls: [], videoUrl: null }
       },
-      socialLinks: user.socialLinks || { instagram: "", tiktok: "", facebook: "" },
+      socialLinks: user.socialLinks || DEFAULT_SOCIAL_LINKS,
       avatarUrl: user.avatarUrl || null,
+      profilePictureUrl: resolveProfilePictureUrl(user),
       _id: user._id
     });
   } catch (err) {
@@ -878,11 +962,44 @@ app.put('/api/profile/social-links', authMiddleware, async (req, res) => {
 app.put('/api/profile/avatar', authMiddleware, async (req, res) => {
   try {
     const { avatarUrl } = req.body;
-    if (!avatarUrl) return res.status(400).json({ error: 'avatarUrl is required' });
-    await User.findByIdAndUpdate(req.user._id, { avatarUrl });
+    if (!avatarUrl || typeof avatarUrl !== 'string') return res.status(400).json({ error: 'avatarUrl is required' });
+    // Basic URL validation to prevent storing arbitrary values
+    let parsedUrl;
+    try { parsedUrl = new URL(avatarUrl); } catch (urlErr) { return res.status(400).json({ error: 'avatarUrl must be a valid URL' }); }
+    if (!['https:', 'http:'].includes(parsedUrl.protocol)) return res.status(400).json({ error: 'avatarUrl must use http or https' });
+    await User.findByIdAndUpdate(req.user._id, { avatarUrl, profilePictureUrl: avatarUrl });
     res.json({ success: true, avatarUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/users/upload-avatar - Upload profile picture (JPG/PNG only, 5MB max)
+app.post('/api/users/upload-avatar', authMiddleware, (req, res, next) => {
+  avatarUpload.single('file')(req, res, (err) => {
+    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'Image must be under 5MB' });
+    }
+    if (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    next();
+  });
+}, async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file provided' });
+    }
+
+    const cloudinaryResult = await uploadToCloudinary(req.file.buffer);
+    const profilePictureUrl = cloudinaryResult.secure_url;
+
+    await User.findByIdAndUpdate(req.user._id, { profilePictureUrl, avatarUrl: profilePictureUrl });
+
+    res.json({ success: true, profilePictureUrl });
+  } catch (err) {
+    console.error('Avatar upload error:', err);
+    res.status(500).json({ error: 'Avatar upload failed' });
   }
 });
 
