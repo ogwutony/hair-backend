@@ -32,9 +32,24 @@ const uploadToCloudinary = (buffer) => {
   });
 };
 
+// Build a descriptive error message for Cloudinary upload failures
+const cloudinaryErrorMessage = (err, context) => {
+  if (err.http_code === 401) {
+    return `${context} failed: invalid Cloudinary credentials. Check CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET in your .env file.`;
+  }
+  return `${context} failed`;
+};
+
 // Validate critical environment variables
 if (!process.env.STRIPE_SECRET_KEY) {
   console.warn("⚠️ WARNING: STRIPE_SECRET_KEY is not defined in .env");
+}
+
+const missingCloudinaryVars = ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'].filter(
+  (key) => !process.env[key]
+);
+if (missingCloudinaryVars.length > 0) {
+  console.warn(`⚠️ WARNING: Missing Cloudinary env vars: ${missingCloudinaryVars.join(', ')}. File uploads will fail.`);
 }
 
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -999,7 +1014,7 @@ app.post('/api/users/upload-avatar', authMiddleware, (req, res, next) => {
     res.json({ success: true, profilePictureUrl });
   } catch (err) {
     console.error('Avatar upload error:', err);
-    res.status(500).json({ error: 'Avatar upload failed' });
+    res.status(500).json({ error: cloudinaryErrorMessage(err, 'Avatar upload') });
   }
 });
 
@@ -1068,7 +1083,7 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
     });
   } catch (err) {
     console.error("Upload Error:", err);
-    res.status(500).json({ error: 'Cloudinary upload failed' });
+    res.status(500).json({ error: cloudinaryErrorMessage(err, 'Upload') });
   }
 });
 
