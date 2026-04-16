@@ -674,7 +674,7 @@ app.post('/api/login', async (req, res) => {
 
 // LOGOUT
 app.post('/api/auth/logout', (req, res) => {
-  res.clearCookie('token', { httpOnly: true, secure: true, sameSite: 'Strict' });
+  res.clearCookie('token', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'Strict' });
   res.json({ success: true });
 });
 
@@ -1169,7 +1169,7 @@ app.get('/api/media/presigned-url', authMiddleware, (req, res) => {
 
   const paramsToSign = `public_id=${publicId}&timestamp=${timestamp}`;
   const signature = crypto
-    .createHash('sha256')
+    .createHash('sha1')
     .update(paramsToSign + process.env.CLOUDINARY_API_SECRET)
     .digest('hex');
 
