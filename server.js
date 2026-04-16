@@ -9,6 +9,8 @@ const axios = require('axios');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { Readable } = require('stream');
+const cookieParser = require('cookie-parser');
+const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 // Cloudinary Configuration
@@ -42,6 +44,7 @@ const app = express();
 
 // Middleware
 app.use(express.json());
+app.use(cookieParser());
 
 // CORS Configuration - Allows multiple origins
 const allowedOrigins = [
@@ -78,7 +81,7 @@ app.use(cors({
   },
   credentials: true, // Required if you are sending cookies or Authorization headers
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie']
 }));
 
 // File upload configuration
@@ -311,6 +314,16 @@ const Media = mongoose.model('Media', new mongoose.Schema({
   expiresAt:   Date
 }));
 
+// Vote tracking — prevents double-voting
+const voteSchema = new mongoose.Schema({
+  userId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  targetId: { type: mongoose.Schema.Types.ObjectId, ref: 'DumaItem', required: true },
+  voteType: { type: String, enum: ['yay', 'nay'], required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+voteSchema.index({ userId: 1, targetId: 1 }, { unique: true });
+const Vote = mongoose.model('Vote', voteSchema);
+
 // --- HELPERS ---
 const JWT_SECRET = process.env.JWT_SECRET || 'majority-hair-default-secret-change-me';
 
@@ -321,12 +334,20 @@ const generateToken = (userId, rememberMe = false) => {
 };
 
 const authMiddleware = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized' });
+  // 1. Try HttpOnly cookie first (secure path)
+  let token = req.cookies?.token;
+
+  // 2. Fall back to Authorization header (legacy path)
+  if (!token) {
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith('Bearer ')) {
+      token = authHeader.split(' ')[1];
+    }
   }
+
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
   try {
-    const token = authHeader.split(' ')[1];
     const decoded = jwt.verify(token, JWT_SECRET);
     const user = await User.findById(decoded.userId);
     if (!user) return res.status(401).json({ error: 'User not found' });
@@ -566,7 +587,15 @@ app.post('/api/auth/google', async (req, res) => {
     
     // Generate JWT
     const token = generateToken(user._id, true);
-    
+
+    const cookieOptions = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'Strict',
+      maxAge: 30 * 24 * 3600000, // 30 days
+    };
+    res.cookie('token', token, cookieOptions);
+
     res.json({
       email: user.email,
       token,
@@ -598,6 +627,14 @@ app.post('/api/signup', async (req, res) => {
     });
     const token = generateToken(user._id, false);
 
+    const cookieOptions = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'Strict',
+      maxAge: 3600000, // 1 hour
+    };
+    res.cookie('token', token, cookieOptions);
+
     res.status(201).json({ message: 'Account created', token, email: user.email, rank_title: user.rank_title });
   } catch (err) {
     res.status(500).json({ error: 'Signup failed' });
@@ -616,6 +653,13 @@ app.post('/api/login', async (req, res) => {
     if (!match) return res.status(401).json({ error: 'Invalid credentials' });
 
     const token = generateToken(user._id, !!rememberMe);
+    const cookieOptions = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'Strict',
+      maxAge: rememberMe ? 30 * 24 * 3600000 : 3600000,
+    };
+    res.cookie('token', token, cookieOptions);
     res.json({
       success: true,
       token,
@@ -626,6 +670,12 @@ app.post('/api/login', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+// LOGOUT
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie('token', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'Strict' });
+  res.json({ success: true });
 });
 
 // FORGOT PASSWORD
@@ -758,6 +808,20 @@ app.post('/api/duma/:id/vote', authMiddleware, async (req, res) => {
     const voteType = req.body.voteType || req.body.vote; // Support both parameter names
     if (!['yay', 'nay'].includes(voteType)) {
       return res.status(400).json({ error: 'Vote must be "yay" or "nay"' });
+    }
+
+    // Prevent double-voting via unique index; throws code 11000 on duplicate
+    try {
+      await Vote.create({
+        userId: req.user._id,
+        targetId: req.params.id,
+        voteType,
+      });
+    } catch (dupErr) {
+      if (dupErr.code === 11000) {
+        return res.status(409).json({ error: 'You have already voted on this item' });
+      }
+      throw dupErr;
     }
 
     const update = voteType === 'yay' ? 
@@ -912,7 +976,7 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
 // PUT /api/profile - Update user profile perspectives
 app.put('/api/profile', authMiddleware, async (req, res) => {
   try {
-    const { perspective, socialLinks } = req.body;
+    const { perspective, socialLinks, avatarUrl } = req.body;
     
     const updateData = {};
     
@@ -930,11 +994,24 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
     if (socialLinks) {
       updateData.socialLinks = { ...socialLinks, updatedAt: new Date() };
     }
+
+    // Accept avatarUrl directly in profile update
+    if (avatarUrl && typeof avatarUrl === 'string') {
+      try {
+        const parsed = new URL(avatarUrl);
+        if (['http:', 'https:'].includes(parsed.protocol)) {
+          updateData.avatarUrl = avatarUrl;
+          updateData.profilePictureUrl = avatarUrl;
+        }
+      } catch (_) { /* ignore invalid URLs */ }
+    }
     
     const user = await User.findByIdAndUpdate(req.user._id, updateData, { new: true });
     res.json({ success: true, message: 'Profile updated successfully', profile: {
       perspective: user.perspective,
-      socialLinks: user.socialLinks
+      socialLinks: user.socialLinks,
+      avatarUrl: user.avatarUrl,
+      profilePictureUrl: user.profilePictureUrl,
     }});
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1069,6 +1146,77 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
   } catch (err) {
     console.error("Upload Error:", err);
     res.status(500).json({ error: 'Cloudinary upload failed' });
+  }
+});
+
+// GET /api/media/presigned-url — generate a Cloudinary signed upload token for direct client upload
+app.get('/api/media/presigned-url', authMiddleware, (req, res) => {
+  const { fileType, contentLength } = req.query;
+
+  const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/webm', 'video/quicktime'];
+  if (!fileType || !ALLOWED_TYPES.includes(fileType)) {
+    return res.status(400).json({ error: 'Invalid or missing fileType' });
+  }
+
+  const maxSize = fileType.startsWith('video') ? 52428800 : 5242880;
+  if (contentLength && parseInt(contentLength) > maxSize) {
+    return res.status(400).json({ error: 'File too large' });
+  }
+
+  const timestamp = Math.round(Date.now() / 1000);
+  const publicId = `user_media/${req.user._id}/${uuidv4()}`;
+  const resourceType = fileType.startsWith('video') ? 'video' : 'image';
+
+  const paramsToSign = `public_id=${publicId}&timestamp=${timestamp}`;
+  const signature = crypto
+    .createHash('sha1')
+    .update(paramsToSign + process.env.CLOUDINARY_API_SECRET)
+    .digest('hex');
+
+  res.json({
+    uploadUrl: `https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`,
+    fields: {
+      api_key: process.env.CLOUDINARY_API_KEY,
+      timestamp,
+      public_id: publicId,
+      signature,
+    },
+    publicId,
+  });
+});
+
+// POST /api/media/confirm — client calls this after a direct Cloudinary upload succeeds
+app.post('/api/media/confirm', authMiddleware, async (req, res) => {
+  try {
+    const { publicId, storageUrl, fileType, size } = req.body;
+    if (!publicId || !storageUrl) {
+      return res.status(400).json({ error: 'publicId and storageUrl are required' });
+    }
+
+    // Verify the asset actually exists on Cloudinary before trusting it
+    const resourceType = fileType?.startsWith('video') ? 'video' : 'image';
+    let cloudinaryAsset;
+    try {
+      cloudinaryAsset = await cloudinary.api.resource(publicId, { resource_type: resourceType });
+    } catch (e) {
+      return res.status(400).json({ error: 'Could not verify asset on Cloudinary' });
+    }
+
+    const media = await Media.create({
+      userId: req.user._id,
+      filename: publicId.split('/').pop(),
+      originalName: publicId.split('/').pop(),
+      mimetype: fileType,
+      size: cloudinaryAsset.bytes || size,
+      type: resourceType,
+      storageUrl: cloudinaryAsset.secure_url,
+      uploadedAt: new Date(),
+    });
+
+    await updateRankScore(req.user._id, 5);
+    res.json({ success: true, media });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
