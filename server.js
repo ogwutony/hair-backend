@@ -10,7 +10,6 @@ const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { Readable } = require('stream');
 const cookieParser = require('cookie-parser');
-const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 // Cloudinary Configuration
@@ -1164,7 +1163,7 @@ app.get('/api/media/presigned-url', authMiddleware, (req, res) => {
   }
 
   const timestamp = Math.round(Date.now() / 1000);
-  const publicId = `user_media/${req.user._id}/${uuidv4()}`;
+  const publicId = `user_media/${req.user._id}/${crypto.randomUUID()}`;
   const resourceType = fileType.startsWith('video') ? 'video' : 'image';
 
   const paramsToSign = `public_id=${publicId}&timestamp=${timestamp}`;
