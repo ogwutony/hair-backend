@@ -41,6 +41,81 @@ if (!process.env.STRIPE_SECRET_KEY) {
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const app = express();
 
+// --- SUBSCRIPTION CONSTANTS ---
+const SUBSCRIPTION_PLAN_3_MONTH   = '3-month-sub';
+const SUBSCRIPTION_STATUS_ACTIVE  = 'active_3_month';
+const REQUIRED_FORMULA_PRODUCTS   = 6;
+const INITIAL_SHIPMENT_COUNT      = 1;
+
+// --- STRIPE WEBHOOK ---
+// Must be registered BEFORE express.json() so that the raw body is available for
+// signature verification. express.raw() captures the body as a Buffer.
+app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!webhookSecret) {
+    console.error('⚠️ STRIPE_WEBHOOK_SECRET is not configured');
+    return res.status(500).json({ error: 'Webhook secret not configured' });
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+  } catch (err) {
+    console.error('⚠️ Webhook signature verification failed:', err.message);
+    return res.status(400).json({ error: 'Webhook signature verification failed' });
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+
+    try {
+      const customerDetails = session.customer_details || {};
+      const shippingDetails = session.shipping_details || {};
+
+      const email = typeof customerDetails.email === 'string'
+        ? customerDetails.email.toLowerCase()
+        : null;
+
+      if (!email) {
+        console.warn('⚠️ checkout.session.completed received without customer email');
+        return res.status(200).json({ received: true });
+      }
+
+      // Build the address object from the Stripe shipping payload
+      const addr = shippingDetails.address || {};
+      const shippingAddress = {
+        name:        shippingDetails.name        || customerDetails.name  || null,
+        phone:       customerDetails.phone                                 || null,
+        line1:       addr.line1        || null,
+        line2:       addr.line2        || null,
+        city:        addr.city         || null,
+        state:       addr.state        || null,
+        postal_code: addr.postal_code  || null,
+        country:     addr.country      || null,
+      };
+
+      await User.findOneAndUpdate(
+        { email },
+        {
+          shippingAddress,
+          subscriptionPlan:   SUBSCRIPTION_PLAN_3_MONTH,
+          subscriptionStatus: SUBSCRIPTION_STATUS_ACTIVE,
+        }
+      );
+
+      console.log(`✅ Webhook: subscription updated for ${email}`);
+    } catch (dbErr) {
+      console.error('❌ Webhook DB update failed:', dbErr.message);
+      // Return 200 so Stripe does not retry — the error is logged for investigation
+      return res.status(200).json({ received: true, warning: 'db_update_failed' });
+    }
+  }
+
+  res.status(200).json({ received: true });
+});
+
 // Middleware
 app.use(express.json());
 app.use(cookieParser());
@@ -259,6 +334,22 @@ const userSchema = new mongoose.Schema({
     tiktok: String,
     facebook: String,
     updatedAt: Date
+  },
+
+  // Subscription / 90-day formula tracking
+  currentFormula:     { type: [String], default: [] },
+  subscriptionStatus: { type: String, default: null },
+  subscriptionPlan:   { type: String, default: null },
+  shipmentCount:      { type: Number, default: INITIAL_SHIPMENT_COUNT },
+  shippingAddress: {
+    name:        String,
+    phone:       String,
+    line1:       String,
+    line2:       String,
+    city:        String,
+    state:       String,
+    postal_code: String,
+    country:     String,
   }
 });
 const User = mongoose.model('User', userSchema);
@@ -968,7 +1059,12 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
       socialLinks: user.socialLinks || DEFAULT_SOCIAL_LINKS,
       avatarUrl: user.avatarUrl || null,
       profilePictureUrl: resolveProfilePictureUrl(user),
-      _id: user._id
+      _id: user._id,
+      currentFormula:     user.currentFormula     || [],
+      subscriptionStatus: user.subscriptionStatus || null,
+      subscriptionPlan:   user.subscriptionPlan   || null,
+      shipmentCount:      user.shipmentCount       ?? INITIAL_SHIPMENT_COUNT,
+      shippingAddress:    user.shippingAddress     || null,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1082,14 +1178,68 @@ app.post('/api/users/upload-avatar', authMiddleware, (req, res, next) => {
   }
 });
 
-// POST /api/profile/add-points - Add points to user rank score
+// POST /api/profile/add-points - Add points to user rank score (requires valid Stripe session)
 app.post('/api/profile/add-points', authMiddleware, async (req, res) => {
   try {
-    const { points } = req.body;
+    const { points, stripeSessionId } = req.body;
     if (!points || typeof points !== 'number') return res.status(400).json({ error: 'points must be a number' });
+
+    // Validate against Stripe to prevent manual score manipulation
+    if (!stripeSessionId) {
+      return res.status(400).json({ error: 'stripeSessionId is required to add points' });
+    }
+
+    try {
+      const session = await stripe.checkout.sessions.retrieve(stripeSessionId);
+      if (session.payment_status !== 'paid') {
+        return res.status(400).json({ error: 'Stripe session has not been paid' });
+      }
+      // Ensure the session belongs to the authenticated user
+      const sessionEmail = session.customer_details?.email?.toLowerCase();
+      if (sessionEmail && sessionEmail !== req.user.email.toLowerCase()) {
+        return res.status(403).json({ error: 'Stripe session does not match the authenticated user' });
+      }
+    } catch (stripeErr) {
+      console.error('Stripe session validation error:', stripeErr.message);
+      return res.status(400).json({ error: 'Invalid or unverifiable Stripe session ID' });
+    }
+
     await updateRankScore(req.user._id, points);
     const user = await User.findById(req.user._id);
     res.json({ success: true, rank_score: user.rank_score, rank_title: user.rank_title });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/profile/save-formula - Save selected product formula to user profile
+app.post('/api/profile/save-formula', authMiddleware, async (req, res) => {
+  try {
+    const { selectedItems } = req.body;
+
+    if (!Array.isArray(selectedItems) || selectedItems.length === 0) {
+      return res.status(400).json({ error: 'selectedItems must be a non-empty array' });
+    }
+
+    // Expect exactly REQUIRED_FORMULA_PRODUCTS product IDs/names
+    if (selectedItems.length !== REQUIRED_FORMULA_PRODUCTS) {
+      return res.status(400).json({ error: `selectedItems must contain exactly ${REQUIRED_FORMULA_PRODUCTS} products` });
+    }
+
+    // Ensure every item is a plain string (prevents NoSQL injection via array elements)
+    if (!selectedItems.every(item => typeof item === 'string' && item.trim().length > 0)) {
+      return res.status(400).json({ error: 'Each item in selectedItems must be a non-empty string' });
+    }
+
+    const sanitizedItems = selectedItems.map(item => item.trim());
+
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      { currentFormula: sanitizedItems },
+      { new: true }
+    );
+
+    res.json({ success: true, currentFormula: user.currentFormula });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
