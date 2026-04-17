@@ -294,6 +294,7 @@ const DumaItem = mongoose.model('DumaItem', new mongoose.Schema({
     tiktok: String,
     facebook: String
   },
+  submitterAvatar: String, // Cloudinary URL captured from the request at submission time
   votes:      { yay: { type: Number, default: 0 }, nay: { type: Number, default: 0 } },
   createdAt:  { type: Date, default: Date.now }
 }));
@@ -842,7 +843,7 @@ app.post('/api/duma/:id/vote', authMiddleware, async (req, res) => {
 // 3. Submit recommendation to Duma
 app.post('/api/duma/recommend', authMiddleware, async (req, res) => {
   try {
-    const { name, company, reason } = req.body;
+    const { name, company, reason, submitterAvatar } = req.body;
     if (!name || !company || !reason) return res.status(400).json({ error: 'All fields required' });
 
     const rankTitle = req.user.rank_title || getRankTitle(req.user.rank_score || 1);
@@ -855,7 +856,8 @@ app.post('/api/duma/recommend', authMiddleware, async (req, res) => {
       submitterRank: rankTitle,
       submitterId: req.user._id,
       submitterProfilePictureUrl: resolveProfilePictureUrl(req.user),
-      submitterSocialLinks: req.user.socialLinks || DEFAULT_SOCIAL_LINKS
+      submitterSocialLinks: req.user.socialLinks || DEFAULT_SOCIAL_LINKS,
+      submitterAvatar: submitterAvatar || resolveProfilePictureUrl(req.user)
     });
 
     await updateRankScore(req.user._id, 5);
@@ -902,7 +904,7 @@ app.post('/api/duma/partner', authMiddleware, async (req, res) => {
 // 5. Submit culture video/perspective to Duma
 app.post('/api/duma/culture', authMiddleware, async (req, res) => {
   try {
-    const { prompt, response, videoUrl, perspective, category } = req.body;
+    const { prompt, response, videoUrl, perspective, category, submitterAvatar } = req.body;
     const rankTitle = req.user.rank_title || getRankTitle(req.user.rank_score || 1);
     const isVideoSubmission = Boolean(videoUrl);
 
@@ -917,7 +919,8 @@ app.post('/api/duma/culture', authMiddleware, async (req, res) => {
       submitterRank: rankTitle,
       submitterId: req.user._id,
       submitterProfilePictureUrl: resolveProfilePictureUrl(req.user),
-      submitterSocialLinks: req.user.socialLinks || DEFAULT_SOCIAL_LINKS
+      submitterSocialLinks: req.user.socialLinks || DEFAULT_SOCIAL_LINKS,
+      submitterAvatar: submitterAvatar || resolveProfilePictureUrl(req.user)
     });
 
     // Award +100 pts for video submissions, +1 pt for text-only
