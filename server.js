@@ -978,7 +978,7 @@ app.post('/api/duma/partner', authMiddleware, async (req, res) => {
     if (!company || !ein || !product || !desc) {
       return res.status(400).json({ error: 'All fields required: company, ein, product, desc' });
     }
-    if (!contractConfirmed) {
+    if (contractConfirmed !== true) {
       return res.status(400).json({ error: 'Digital contract confirmation is required' });
     }
 
@@ -998,7 +998,7 @@ app.post('/api/duma/partner', authMiddleware, async (req, res) => {
       product,
       desc,
       inventory: inventory || null,
-      contractConfirmed: Boolean(contractConfirmed),
+      contractConfirmed: true,
       submittedBy: req.user.email,
       submitterRank: rankTitle,
       submitterId: req.user._id,
