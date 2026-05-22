@@ -459,6 +459,20 @@ const authMiddleware = async (req, res, next) => {
   }
 };
 
+const requireBearerAuthorizationHeader = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authorization header with Bearer token is required' });
+  }
+
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'Authorization header with Bearer token is required' });
+  }
+
+  next();
+};
+
 const sendEmail = async (to, subject, html) => {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
     console.error("❌ Email credentials missing.");
@@ -942,7 +956,7 @@ app.post('/api/duma/:id/vote', authMiddleware, async (req, res) => {
 });
 
 // 3. Submit recommendation to Duma
-app.post('/api/duma/recommend', authMiddleware, async (req, res) => {
+app.post('/api/duma/recommend', requireBearerAuthorizationHeader, authMiddleware, async (req, res) => {
   try {
     const { name, brand, webLink, reason, submitterAvatar } = req.body;
     if (!name || !brand || !webLink || !reason) {
@@ -972,7 +986,7 @@ app.post('/api/duma/recommend', authMiddleware, async (req, res) => {
 });
 
 // 4. Submit partner application to Duma
-app.post('/api/duma/partner', authMiddleware, async (req, res) => {
+app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, async (req, res) => {
   try {
     const { company, ein, product, desc, inventory, contractConfirmed, tier } = req.body;
     if (!company || !ein || !product || !desc) {
