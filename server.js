@@ -435,10 +435,15 @@ const generateToken = (userId, rememberMe = false) => {
 };
 
 const authMiddleware = async (req, res, next) => {
-  // 1. Try HttpOnly cookie first (secure path)
-  let token = req.cookies?.token;
+  // 1. Prefer token pre-validated by route-level middleware, if present
+  let token = req.bearerToken;
 
-  // 2. Fall back to Authorization header (legacy path)
+  // 2. Try HttpOnly cookie next (secure path)
+  if (!token) {
+    token = req.cookies?.token;
+  }
+
+  // 3. Fall back to Authorization header (legacy path)
   if (!token) {
     const authHeader = req.headers.authorization;
     if (authHeader?.startsWith('Bearer ')) {
@@ -461,10 +466,12 @@ const authMiddleware = async (req, res, next) => {
 
 const requireBearerAuthorizationHeader = (req, res, next) => {
   const authHeader = req.headers.authorization;
-  if (!/^Bearer\s+\S+$/.test(authHeader || '')) {
+  const bearerMatch = (authHeader || '').match(/^Bearer\s+(\S+)$/);
+  if (!bearerMatch) {
     return res.status(401).json({ error: 'Authorization header with Bearer token is required' });
   }
 
+  req.bearerToken = bearerMatch[1];
   next();
 };
 
