@@ -435,10 +435,15 @@ const generateToken = (userId, rememberMe = false) => {
 };
 
 const authMiddleware = async (req, res, next) => {
-  // 1. Try HttpOnly cookie first (secure path)
-  let token = req.cookies?.token;
+  // 1. Prefer token pre-validated by route-level middleware, if present
+  let token = req.bearerToken;
 
-  // 2. Fall back to Authorization header (legacy path)
+  // 2. Try HttpOnly cookie next (secure path)
+  if (!token) {
+    token = req.cookies?.token;
+  }
+
+  // 3. Fall back to Authorization header (legacy path)
   if (!token) {
     const authHeader = req.headers.authorization;
     if (authHeader?.startsWith('Bearer ')) {
@@ -457,6 +462,17 @@ const authMiddleware = async (req, res, next) => {
   } catch (err) {
     return res.status(401).json({ error: 'Invalid token' });
   }
+};
+
+const requireBearerAuthorizationHeader = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  const bearerMatch = (authHeader || '').match(/^Bearer\s+(\S+)$/);
+  if (!bearerMatch) {
+    return res.status(401).json({ error: 'Authorization header with Bearer token is required' });
+  }
+
+  req.bearerToken = bearerMatch[1];
+  next();
 };
 
 const sendEmail = async (to, subject, html) => {
@@ -942,7 +958,7 @@ app.post('/api/duma/:id/vote', authMiddleware, async (req, res) => {
 });
 
 // 3. Submit recommendation to Duma
-app.post('/api/duma/recommend', authMiddleware, async (req, res) => {
+app.post('/api/duma/recommend', requireBearerAuthorizationHeader, authMiddleware, async (req, res) => {
   try {
     const { name, brand, webLink, reason, submitterAvatar } = req.body;
     if (!name || !brand || !webLink || !reason) {
@@ -972,7 +988,7 @@ app.post('/api/duma/recommend', authMiddleware, async (req, res) => {
 });
 
 // 4. Submit partner application to Duma
-app.post('/api/duma/partner', authMiddleware, async (req, res) => {
+app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, async (req, res) => {
   try {
     const { company, ein, product, desc, inventory, contractConfirmed, tier } = req.body;
     if (!company || !ein || !product || !desc) {
