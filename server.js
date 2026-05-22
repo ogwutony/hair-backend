@@ -461,12 +461,7 @@ const authMiddleware = async (req, res, next) => {
 
 const requireBearerAuthorizationHeader = (req, res, next) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Authorization header with Bearer token is required' });
-  }
-
-  const token = authHeader.split(' ')[1];
-  if (!token) {
+  if (!/^Bearer\s+\S+$/.test(authHeader || '')) {
     return res.status(401).json({ error: 'Authorization header with Bearer token is required' });
   }
 
