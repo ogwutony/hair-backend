@@ -364,14 +364,20 @@ const Order = mongoose.model('Order', new mongoose.Schema({
 }));
 
 // Duma (formerly Legislature) submissions
-const DumaItem = mongoose.model('DumaItem', new mongoose.Schema({
-  type:       { type: String, required: true }, // "Recommendation" | "Partner" | "Culture"
+const dumaSchema = new mongoose.Schema({
+  type:       { type: String, required: true, enum: ['Culture', 'Product Recommendation', 'Partner'] },
+  section:    String,
   category:   String,
   company:    String,
   product:    String,
   name:       String,
+  brand:      String,   // Product Recommendation: brand name
+  webLink:    String,   // Product Recommendation: product URL
   reason:     String,
   desc:       String,
+  ein:        String,   // Partner: Employer Identification Number
+  inventory:  { type: mongoose.Schema.Types.Mixed }, // Partner: structured inventory parameters
+  contractConfirmed: { type: Boolean, default: false }, // Partner: digital contract confirmation
   prompt:     String,
   response:   String,
   videoUrl:   String, // Culture video URL
@@ -388,7 +394,11 @@ const DumaItem = mongoose.model('DumaItem', new mongoose.Schema({
   submitterAvatar: String, // Cloudinary URL captured from the request at submission time
   votes:      { yay: { type: Number, default: 0 }, nay: { type: Number, default: 0 } },
   createdAt:  { type: Date, default: Date.now }
-}));
+});
+
+dumaSchema.index({ section: 1, type: 1 });
+
+const DumaItem = mongoose.model('DumaItem', dumaSchema);
 
 // Media uploads
 const Media = mongoose.model('Media', new mongoose.Schema({
@@ -521,7 +531,7 @@ const updateRankScore = async (userId, pointsToAdd) => {
 // --- ROUTES ---
 
 // Allowed Duma item types for safe query filtering
-const ALLOWED_DUMA_TYPES = new Set(['Recommendation', 'Partner', 'Culture']);
+const ALLOWED_DUMA_TYPES = new Set(['Product Recommendation', 'Partner', 'Culture']);
 
 // Helper: resolve the canonical profile picture URL for a user document
 const resolveProfilePictureUrl = (user) => user.profilePictureUrl || user.avatarUrl || null;
@@ -934,14 +944,17 @@ app.post('/api/duma/:id/vote', authMiddleware, async (req, res) => {
 // 3. Submit recommendation to Duma
 app.post('/api/duma/recommend', authMiddleware, async (req, res) => {
   try {
-    const { name, company, reason, submitterAvatar } = req.body;
-    if (!name || !company || !reason) return res.status(400).json({ error: 'All fields required' });
+    const { name, brand, webLink, reason, submitterAvatar } = req.body;
+    if (!name || !brand || !webLink || !reason) {
+      return res.status(400).json({ error: 'All fields required: name, brand, webLink, reason' });
+    }
 
     const rankTitle = req.user.rank_title || getRankTitle(req.user.rank_score || 1);
     const item = await DumaItem.create({
-      type: 'Recommendation',
+      type: 'Product Recommendation',
       name,
-      company,
+      brand,
+      webLink,
       reason,
       submittedBy: req.user.email,
       submitterRank: rankTitle,
@@ -961,8 +974,13 @@ app.post('/api/duma/recommend', authMiddleware, async (req, res) => {
 // 4. Submit partner application to Duma
 app.post('/api/duma/partner', authMiddleware, async (req, res) => {
   try {
-    const { company, product, desc, tier } = req.body;
-    if (!company || !product || !desc) return res.status(400).json({ error: 'All fields required' });
+    const { company, ein, product, desc, inventory, contractConfirmed, tier } = req.body;
+    if (!company || !ein || !product || !desc) {
+      return res.status(400).json({ error: 'All fields required: company, ein, product, desc' });
+    }
+    if (!contractConfirmed) {
+      return res.status(400).json({ error: 'Digital contract confirmation is required' });
+    }
 
     const rankScore = req.user.rank_score || 1;
     const rankTitle = req.user.rank_title || getRankTitle(rankScore);
@@ -976,8 +994,11 @@ app.post('/api/duma/partner', authMiddleware, async (req, res) => {
     const item = await DumaItem.create({
       type: 'Partner',
       company,
+      ein,
       product,
       desc,
+      inventory: inventory || null,
+      contractConfirmed: Boolean(contractConfirmed),
       submittedBy: req.user.email,
       submitterRank: rankTitle,
       submitterId: req.user._id,
