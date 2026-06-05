@@ -116,6 +116,76 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
   res.status(200).json({ received: true });
 });
 
+// --- SHOPIFY WEBHOOK ---
+// Must be registered BEFORE express.json() so that the raw body is available for
+// HMAC signature verification. express.raw() captures the body as a Buffer.
+app.post('/api/webhooks/shopify/orders-create', express.raw({ type: 'application/json' }), async (req, res) => {
+  const shopifySecret = process.env.SHOPIFY_WEBHOOK_SECRET;
+
+  if (!shopifySecret) {
+    console.error('⚠️ SHOPIFY_WEBHOOK_SECRET is not configured');
+    return res.status(500).json({ error: 'Shopify webhook secret not configured' });
+  }
+
+  // Verify Shopify HMAC signature
+  const hmacHeader = req.headers['x-shopify-hmac-sha256'];
+  if (!hmacHeader) {
+    return res.status(401).json({ error: 'Missing Shopify HMAC header' });
+  }
+
+  const generatedHmac = crypto
+    .createHmac('sha256', shopifySecret)
+    .update(req.body)
+    .digest('base64');
+
+  if (generatedHmac !== hmacHeader) {
+    console.error('⚠️ Shopify webhook HMAC verification failed');
+    return res.status(401).json({ error: 'Shopify webhook HMAC verification failed' });
+  }
+
+  let order;
+  try {
+    order = JSON.parse(req.body.toString('utf8'));
+  } catch (parseErr) {
+    console.error('⚠️ Failed to parse Shopify order payload:', parseErr.message);
+    return res.status(400).json({ error: 'Invalid JSON payload' });
+  }
+
+  // Only award points for fully paid orders
+  if (order.financial_status !== 'paid') {
+    return res.status(200).json({ received: true, skipped: 'order_not_paid' });
+  }
+
+  const email = typeof order.email === 'string' ? order.email.toLowerCase() : null;
+  if (!email) {
+    console.warn('⚠️ Shopify orders/create received without customer email');
+    return res.status(200).json({ received: true, skipped: 'no_customer_email' });
+  }
+
+  try {
+    const user = await User.findOne({ email });
+    if (!user) {
+      // Not a registered user — acknowledge and move on
+      return res.status(200).json({ received: true, skipped: 'user_not_found' });
+    }
+
+    const totalPrice = parseFloat(order.total_price) || 0;
+    const pointsPerDollar = parseInt(process.env.SHOPIFY_POINTS_PER_DOLLAR, 10) || 100;
+    const pointsToAward = Math.floor(totalPrice * pointsPerDollar);
+
+    if (pointsToAward > 0) {
+      await updateRankScore(user._id, pointsToAward);
+      console.log(`✅ Shopify webhook: awarded ${pointsToAward} points to ${email} for order ${order.id} ($${totalPrice})`);
+    }
+  } catch (dbErr) {
+    console.error('❌ Shopify webhook DB update failed:', dbErr.message);
+    // Return 200 so Shopify does not retry — the error is logged for investigation
+    return res.status(200).json({ received: true, warning: 'db_update_failed' });
+  }
+
+  res.status(200).json({ received: true });
+});
+
 // Middleware
 app.use(express.json());
 app.use(cookieParser());
@@ -244,6 +314,26 @@ const getRankRange = (title) => {
 };
 
 const isPolitburoOrHigher = (score) => score >= POLITBURO_MIN;
+
+// Premium Partner threshold — users must reach 10,000,000 points to access partner features
+const PARTNER_PREMIUM_MIN = 10000000;
+
+// Middleware: requires the authenticated user to hold Partner Premium rank (≥ 10,000,000 points)
+const requirePolitburoPartner = async (req, res, next) => {
+  // Depends on authMiddleware having run first to populate req.user
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const score = req.user.rank_score || 0;
+  if (score < PARTNER_PREMIUM_MIN) {
+    return res.status(403).json({
+      error: 'Access denied. Partner Premium features require 10,000,000 points.',
+      current_score: score,
+      required_score: PARTNER_PREMIUM_MIN
+    });
+  }
+  next();
+};
 
 // --- MongoDB Models API Integration ---
 const MONGODB_MODELS_API_KEY = process.env.MONGODB_MODELS_API_KEY;
@@ -988,6 +1078,8 @@ app.post('/api/duma/recommend', requireBearerAuthorizationHeader, authMiddleware
 });
 
 // 4. Submit partner application to Duma
+// Standard applications are available to all authenticated users.
+// Premium tier requires the requirePolitburoPartner middleware (≥ 10,000,000 points).
 app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, async (req, res) => {
   try {
     const { company, ein, product, desc, inventory, contractConfirmed, tier } = req.body;
@@ -1001,9 +1093,11 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
     const rankScore = req.user.rank_score || 1;
     const rankTitle = req.user.rank_title || getRankTitle(rankScore);
 
-    if (tier === 'Premium' && !isPolitburoOrHigher(rankScore)) {
+    if (tier === 'Premium' && rankScore < PARTNER_PREMIUM_MIN) {
       return res.status(403).json({
-        error: 'Premium Partner status requires Politburo rank or higher. Keep building your influence!'
+        error: 'Premium Partner status requires 10,000,000 points.',
+        current_score: rankScore,
+        required_score: PARTNER_PREMIUM_MIN
       });
     }
 
@@ -1429,6 +1523,19 @@ app.delete('/api/media/:mediaId', authMiddleware, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ========== PREMIUM PARTNER ENDPOINTS ==========
+// All routes below require authentication AND ≥ 10,000,000 rank points.
+
+// GET /api/partner/premium/status — check whether the authenticated user has Partner Premium access
+app.get('/api/partner/premium/status', requireBearerAuthorizationHeader, authMiddleware, requirePolitburoPartner, (req, res) => {
+  res.json({
+    access: true,
+    rank_score: req.user.rank_score,
+    rank_title: req.user.rank_title,
+    message: 'You have Partner Premium access.'
+  });
 });
 
 // ========== LEADERBOARD ==========
