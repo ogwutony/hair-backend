@@ -169,13 +169,22 @@ app.post('/api/webhooks/shopify/orders-create', express.raw({ type: 'application
       return res.status(200).json({ received: true, skipped: 'user_not_found' });
     }
 
-    const totalPrice = parseFloat(order.total_price) || 0;
+    // Idempotency: skip if this order has already been processed
+    const orderIdStr = String(order.id);
+    const alreadyProcessed = await ShopifyWebhookEvent.findOne({ orderId: orderIdStr });
+    if (alreadyProcessed) {
+      return res.status(200).json({ received: true, skipped: 'already_processed' });
+    }
+
+    // Use integer arithmetic on cents to avoid floating-point precision errors
+    const totalCents = Math.round(parseFloat(order.total_price) * 100) || 0;
     const pointsPerDollar = parseInt(process.env.SHOPIFY_POINTS_PER_DOLLAR, 10) || 100;
-    const pointsToAward = Math.floor(totalPrice * pointsPerDollar);
+    const pointsToAward = Math.floor(totalCents * pointsPerDollar / 100);
 
     if (pointsToAward > 0) {
       await updateRankScore(user._id, pointsToAward);
-      console.log(`✅ Shopify webhook: awarded ${pointsToAward} points to ${email} for order ${order.id} ($${totalPrice})`);
+      await ShopifyWebhookEvent.create({ orderId: orderIdStr, email, pointsAwarded: pointsToAward });
+      console.log(`✅ Shopify webhook: awarded ${pointsToAward} points to ${email} for order ${order.id} ($${order.total_price})`);
     }
   } catch (dbErr) {
     console.error('❌ Shopify webhook DB update failed:', dbErr.message);
@@ -319,7 +328,7 @@ const isPolitburoOrHigher = (score) => score >= POLITBURO_MIN;
 const PARTNER_PREMIUM_MIN = 10000000;
 
 // Middleware: requires the authenticated user to hold Partner Premium rank (≥ 10,000,000 points)
-const requirePolitburoPartner = async (req, res, next) => {
+const requirePartnerPremium = async (req, res, next) => {
   // Depends on authMiddleware having run first to populate req.user
   if (!req.user) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -514,6 +523,15 @@ const voteSchema = new mongoose.Schema({
 });
 voteSchema.index({ userId: 1, targetId: 1 }, { unique: true });
 const Vote = mongoose.model('Vote', voteSchema);
+
+// Shopify webhook event log — prevents double point awards on redelivered webhooks
+const shopifyWebhookEventSchema = new mongoose.Schema({
+  orderId:      { type: String, required: true, unique: true }, // Shopify order ID (string for safety)
+  email:        { type: String, required: true },
+  pointsAwarded: { type: Number, required: true },
+  processedAt:  { type: Date, default: Date.now }
+});
+const ShopifyWebhookEvent = mongoose.model('ShopifyWebhookEvent', shopifyWebhookEventSchema);
 
 // --- HELPERS ---
 const JWT_SECRET = process.env.JWT_SECRET || 'majority-hair-default-secret-change-me';
@@ -1079,7 +1097,7 @@ app.post('/api/duma/recommend', requireBearerAuthorizationHeader, authMiddleware
 
 // 4. Submit partner application to Duma
 // Standard applications are available to all authenticated users.
-// Premium tier requires the requirePolitburoPartner middleware (≥ 10,000,000 points).
+// Premium tier requires the requirePartnerPremium middleware (≥ 10,000,000 points).
 app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, async (req, res) => {
   try {
     const { company, ein, product, desc, inventory, contractConfirmed, tier } = req.body;
@@ -1529,7 +1547,7 @@ app.delete('/api/media/:mediaId', authMiddleware, async (req, res) => {
 // All routes below require authentication AND ≥ 10,000,000 rank points.
 
 // GET /api/partner/premium/status — check whether the authenticated user has Partner Premium access
-app.get('/api/partner/premium/status', requireBearerAuthorizationHeader, authMiddleware, requirePolitburoPartner, (req, res) => {
+app.get('/api/partner/premium/status', requireBearerAuthorizationHeader, authMiddleware, requirePartnerPremium, (req, res) => {
   res.json({
     access: true,
     rank_score: req.user.rank_score,
