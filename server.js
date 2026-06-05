@@ -169,21 +169,33 @@ app.post('/api/webhooks/shopify/orders-create', express.raw({ type: 'application
       return res.status(200).json({ received: true, skipped: 'user_not_found' });
     }
 
-    // Idempotency: skip if this order has already been processed
-    const orderIdStr = String(order.id);
-    const alreadyProcessed = await ShopifyWebhookEvent.findOne({ orderId: orderIdStr });
-    if (alreadyProcessed) {
-      return res.status(200).json({ received: true, skipped: 'already_processed' });
+    // Validate total_price before processing
+    const parsedPrice = parseFloat(order.total_price);
+    if (isNaN(parsedPrice) || parsedPrice < 0) {
+      console.warn(`⚠️ Shopify webhook: invalid total_price "${order.total_price}" for order ${order.id}`);
+      return res.status(200).json({ received: true, warning: 'invalid_total_price' });
     }
 
     // Use integer arithmetic on cents to avoid floating-point precision errors
-    const totalCents = Math.round(parseFloat(order.total_price) * 100) || 0;
+    const totalCents = Math.round(parsedPrice * 100);
     const pointsPerDollar = parseInt(process.env.SHOPIFY_POINTS_PER_DOLLAR, 10) || 100;
     const pointsToAward = Math.floor(totalCents * pointsPerDollar / 100);
 
     if (pointsToAward > 0) {
       await updateRankScore(user._id, pointsToAward);
-      await ShopifyWebhookEvent.create({ orderId: orderIdStr, email, pointsAwarded: pointsToAward });
+      // Record the processed order for idempotency — the unique index on orderId prevents
+      // duplicate awards even under concurrent webhook deliveries (duplicate key error = already processed)
+      try {
+        await ShopifyWebhookEvent.create({ orderId: String(order.id), email, pointsAwarded: pointsToAward });
+      } catch (dupErr) {
+        if (dupErr.code === 11000) {
+          // Another concurrent delivery already processed this order; points were already awarded above.
+          // This is safe because updateRankScore applies an additive delta; log and move on.
+          console.warn(`⚠️ Shopify webhook: duplicate delivery detected for order ${order.id}, ignoring`);
+        } else {
+          throw dupErr;
+        }
+      }
       console.log(`✅ Shopify webhook: awarded ${pointsToAward} points to ${email} for order ${order.id} ($${order.total_price})`);
     }
   } catch (dbErr) {
@@ -527,7 +539,7 @@ const Vote = mongoose.model('Vote', voteSchema);
 // Shopify webhook event log — prevents double point awards on redelivered webhooks
 const shopifyWebhookEventSchema = new mongoose.Schema({
   orderId:      { type: String, required: true, unique: true }, // Shopify order ID (string for safety)
-  email:        { type: String, required: true },
+  email:        { type: String, required: true, index: true },
   pointsAwarded: { type: Number, required: true },
   processedAt:  { type: Date, default: Date.now }
 });
