@@ -1449,6 +1449,8 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
     await updateRankScore(req.user._id, 5);
     
     res.json({
+      success: true,
+      url: media.storageUrl,
       _id: media._id,
       filename: media.filename,
       storageUrl: media.storageUrl,
