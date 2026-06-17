@@ -467,20 +467,20 @@ const userSchema = new mongoose.Schema({
   // OAuth tokens for social publishing (Share to Socials feature)
   socialTokens: {
     instagram: {
-      accessToken:             { type: String, default: null },
-      expiresAt:               { type: Date,   default: null },
-      instagramBusinessAccountId: { type: String, default: null }
+      accessToken: String,
+      expiresAt: Date,
+      instagramBusinessAccountId: String
     },
     tiktok: {
-      accessToken:  { type: String, default: null },
-      refreshToken: { type: String, default: null },
-      expiresAt:    { type: Date,   default: null },
-      openId:       { type: String, default: null }
+      accessToken: String,
+      refreshToken: String,
+      expiresAt: Date,
+      openId: String
     },
     facebook: {
-      accessToken:  { type: String, default: null },
-      expiresAt:    { type: Date,   default: null },
-      pageOrUserId: { type: String, default: null }
+      accessToken: String,
+      expiresAt: Date,
+      pageOrUserId: String
     }
   },
 const User = mongoose.model('User', userSchema);
