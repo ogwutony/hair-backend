@@ -12,7 +12,7 @@ const { Readable } = require('stream');
 const cookieParser = require('cookie-parser');
 require('dotenv').config();
 
-// Cloudinary Configuration
+// Cloudinary Configurationh
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -463,6 +463,26 @@ const userSchema = new mongoose.Schema({
     country:     String,
   }
 });
+
+  // OAuth tokens for social publishing (Share to Socials feature)
+  socialTokens: {
+    instagram: {
+      accessToken:             { type: String, default: null },
+      expiresAt:               { type: Date,   default: null },
+      instagramBusinessAccountId: { type: String, default: null }
+    },
+    tiktok: {
+      accessToken:  { type: String, default: null },
+      refreshToken: { type: String, default: null },
+      expiresAt:    { type: Date,   default: null },
+      openId:       { type: String, default: null }
+    },
+    facebook: {
+      accessToken:  { type: String, default: null },
+      expiresAt:    { type: Date,   default: null },
+      pageOrUserId: { type: String, default: null }
+    }
+  },
 const User = mongoose.model('User', userSchema);
 
 const Order = mongoose.model('Order', new mongoose.Schema({
@@ -1580,6 +1600,252 @@ app.get('/api/leaderboard', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch leaderboard' });
   }
+});
+
+
+// ========== SOCIAL SHARE ROUTES ==========
+
+// --- FACEBOOK / INSTAGRAM OAUTH ---
+
+// GET /api/auth/facebook — redirect user to Facebook OAuth consent screen
+app.get('/api/auth/facebook', (req, res) => {
+  const { META_APP_ID, FRONTEND_URL } = process.env;
+  const redirectUri = encodeURIComponent((process.env.BACKEND_URL || 'https://hair-backend-orpin.vercel.app') + '/api/auth/facebook/callback');
+  const scopes = 'email,public_profile,pages_show_list,pages_manage_posts,instagram_content_publish';
+  const fbUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${META_APP_ID}&redirect_uri=${redirectUri}&scope=${scopes}&response_type=code`;
+  res.redirect(fbUrl);
+});
+
+// GET /api/auth/facebook/callback — exchange code for long-lived token & save
+app.get('/api/auth/facebook/callback', authMiddleware, async (req, res) => {
+  try {
+    const { code } = req.query;
+    if (!code) return res.status(400).json({ error: 'No code returned from Facebook' });
+
+    const { META_APP_ID, META_APP_SECRET, FRONTEND_URL } = process.env;
+    const redirectUri = (process.env.BACKEND_URL || 'https://hair-backend-orpin.vercel.app') + '/api/auth/facebook/callback';
+
+    // Exchange code for short-lived token
+    const tokenRes = await axios.get('https://graph.facebook.com/v19.0/oauth/access_token', {
+      params: { client_id: META_APP_ID, client_secret: META_APP_SECRET, redirect_uri: redirectUri, code }
+    });
+    const shortToken = tokenRes.data.access_token;
+
+    // Exchange for long-lived token (60 days)
+    const longRes = await axios.get('https://graph.facebook.com/v19.0/oauth/access_token', {
+      params: { grant_type: 'fb_exchange_token', client_id: META_APP_ID, client_secret: META_APP_SECRET, fb_exchange_token: shortToken }
+    });
+    const longToken = longRes.data.access_token;
+    const expiresIn = longRes.data.expires_in || 5184000; // default 60 days
+
+    // Get connected Facebook Page (needed for pages_manage_posts)
+    let pageOrUserId = null;
+    let instagramBusinessAccountId = null;
+    let instagramToken = longToken;
+    try {
+      const pagesRes = await axios.get('https://graph.facebook.com/v19.0/me/accounts', {
+        params: { access_token: longToken }
+      });
+      const firstPage = pagesRes.data.data && pagesRes.data.data[0];
+      if (firstPage) {
+        pageOrUserId = firstPage.id;
+        // Try to get linked Instagram Business Account
+        const igRes = await axios.get(`https://graph.facebook.com/v19.0/${firstPage.id}`, {
+          params: { fields: 'instagram_business_account', access_token: firstPage.access_token }
+        });
+        if (igRes.data.instagram_business_account) {
+          instagramBusinessAccountId = igRes.data.instagram_business_account.id;
+          instagramToken = firstPage.access_token;
+        }
+      }
+    } catch (pagesErr) {
+      console.warn('Could not fetch Facebook pages:', pagesErr.message);
+    }
+
+    const expiresAt = new Date(Date.now() + expiresIn * 1000);
+
+    await User.findByIdAndUpdate(req.user._id, {
+      'socialTokens.facebook.accessToken': longToken,
+      'socialTokens.facebook.expiresAt': expiresAt,
+      'socialTokens.facebook.pageOrUserId': pageOrUserId,
+      'socialTokens.instagram.accessToken': instagramToken,
+      'socialTokens.instagram.expiresAt': expiresAt,
+      'socialTokens.instagram.instagramBusinessAccountId': instagramBusinessAccountId,
+    });
+
+    res.redirect((FRONTEND_URL || 'https://www.majorityhairsolutions.com') + '?social=connected&platform=facebook');
+  } catch (err) {
+    console.error('Facebook OAuth error:', err.message);
+    res.redirect((process.env.FRONTEND_URL || 'https://www.majorityhairsolutions.com') + '?social=error&platform=facebook');
+  }
+});
+
+// --- TIKTOK OAUTH ---
+
+// GET /api/auth/tiktok — redirect user to TikTok OAuth consent screen
+app.get('/api/auth/tiktok', (req, res) => {
+  const { TIKTOK_CLIENT_KEY, BACKEND_URL, FRONTEND_URL } = process.env;
+  const redirectUri = encodeURIComponent((BACKEND_URL || 'https://hair-backend-orpin.vercel.app') + '/api/auth/tiktok/callback');
+  const csrfState = crypto.randomBytes(16).toString('hex');
+  const scopes = 'video.upload,share.sound.create';
+  const ttUrl = `https://www.tiktok.com/v2/auth/authorize/?client_key=${TIKTOK_CLIENT_KEY}&response_type=code&scope=${scopes}&redirect_uri=${redirectUri}&state=${csrfState}`;
+  res.redirect(ttUrl);
+});
+
+// GET /api/auth/tiktok/callback — exchange code for tokens & save
+app.get('/api/auth/tiktok/callback', authMiddleware, async (req, res) => {
+  try {
+    const { code } = req.query;
+    if (!code) return res.status(400).json({ error: 'No code returned from TikTok' });
+
+    const { TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET, BACKEND_URL, FRONTEND_URL } = process.env;
+    const redirectUri = (BACKEND_URL || 'https://hair-backend-orpin.vercel.app') + '/api/auth/tiktok/callback';
+
+    const tokenRes = await axios.post('https://open.tiktokapis.com/v2/oauth/token/', {
+      client_key: TIKTOK_CLIENT_KEY,
+      client_secret: TIKTOK_CLIENT_SECRET,
+      code,
+      grant_type: 'authorization_code',
+      redirect_uri: redirectUri
+    }, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+
+    const { access_token, refresh_token, expires_in, open_id } = tokenRes.data;
+    const expiresAt = new Date(Date.now() + (expires_in || 86400) * 1000);
+
+    await User.findByIdAndUpdate(req.user._id, {
+      'socialTokens.tiktok.accessToken': access_token,
+      'socialTokens.tiktok.refreshToken': refresh_token,
+      'socialTokens.tiktok.expiresAt': expiresAt,
+      'socialTokens.tiktok.openId': open_id,
+    });
+
+    res.redirect((FRONTEND_URL || 'https://www.majorityhairsolutions.com') + '?social=connected&platform=tiktok');
+  } catch (err) {
+    console.error('TikTok OAuth error:', err.message);
+    res.redirect((process.env.FRONTEND_URL || 'https://www.majorityhairsolutions.com') + '?social=error&platform=tiktok');
+  }
+});
+
+// GET /api/auth/social-status — return which platforms user has connected
+app.get('/api/auth/social-status', authMiddleware, async (req, res) => {
+  const tokens = req.user.socialTokens || {};
+  const now = new Date();
+  res.json({
+    facebook: !!(tokens.facebook && tokens.facebook.accessToken && (!tokens.facebook.expiresAt || new Date(tokens.facebook.expiresAt) > now)),
+    instagram: !!(tokens.instagram && tokens.instagram.accessToken && tokens.instagram.instagramBusinessAccountId && (!tokens.instagram.expiresAt || new Date(tokens.instagram.expiresAt) > now)),
+    tiktok: !!(tokens.tiktok && tokens.tiktok.accessToken && (!tokens.tiktok.expiresAt || new Date(tokens.tiktok.expiresAt) > now)),
+  });
+});
+
+// POST /api/profile/share — publish a video to connected social platforms
+// Body: { videoUrl: string (absolute Cloudinary URL), platforms: ['instagram','tiktok','facebook'], caption: string }
+app.post('/api/profile/share', authMiddleware, async (req, res) => {
+  const { videoUrl, platforms, caption } = req.body;
+
+  if (!videoUrl || !platforms || !Array.isArray(platforms) || platforms.length === 0) {
+    return res.status(400).json({ error: 'videoUrl and platforms[] are required' });
+  }
+
+  // Validate videoUrl is an absolute https URL (must be Cloudinary or public CDN)
+  let parsedUrl;
+  try { parsedUrl = new URL(videoUrl); } catch (_) { return res.status(400).json({ error: 'videoUrl must be a valid absolute URL' }); }
+  if (!['https:', 'http:'].includes(parsedUrl.protocol)) {
+    return res.status(400).json({ error: 'videoUrl must use http or https' });
+  }
+
+  const tokens = req.user.socialTokens || {};
+  const now = new Date();
+  const results = {};
+
+  // --- INSTAGRAM ---
+  if (platforms.includes('instagram')) {
+    const ig = tokens.instagram || {};
+    if (!ig.accessToken || !ig.instagramBusinessAccountId) {
+      results.instagram = { success: false, error: 'Instagram not connected. Visit /api/auth/facebook to connect.' };
+    } else if (ig.expiresAt && new Date(ig.expiresAt) <= now) {
+      results.instagram = { success: false, error: 'Instagram token expired. Please reconnect.' };
+    } else {
+      try {
+        // Step 1: Create media container
+        const containerRes = await axios.post(
+          `https://graph.facebook.com/v19.0/${ig.instagramBusinessAccountId}/media`,
+          { video_url: videoUrl, caption: caption || '', media_type: 'REELS', share_to_feed: true, access_token: ig.accessToken }
+        );
+        const containerId = containerRes.data.id;
+
+        // Step 2: Poll for container status (up to 60s)
+        let status = 'IN_PROGRESS';
+        for (let i = 0; i < 12 && status === 'IN_PROGRESS'; i++) {
+          await new Promise(r => setTimeout(r, 5000));
+          const statusRes = await axios.get(`https://graph.facebook.com/v19.0/${containerId}`, {
+            params: { fields: 'status_code', access_token: ig.accessToken }
+          });
+          status = statusRes.data.status_code;
+        }
+
+        if (status !== 'FINISHED') {
+          results.instagram = { success: false, error: `Container not ready: ${status}` };
+        } else {
+          // Step 3: Publish
+          const publishRes = await axios.post(
+            `https://graph.facebook.com/v19.0/${ig.instagramBusinessAccountId}/media_publish`,
+            { creation_id: containerId, access_token: ig.accessToken }
+          );
+          results.instagram = { success: true, mediaId: publishRes.data.id };
+        }
+      } catch (err) {
+        results.instagram = { success: false, error: err.response?.data?.error?.message || err.message };
+      }
+    }
+  }
+
+  // --- TIKTOK ---
+  if (platforms.includes('tiktok')) {
+    const tt = tokens.tiktok || {};
+    if (!tt.accessToken || !tt.openId) {
+      results.tiktok = { success: false, error: 'TikTok not connected. Visit /api/auth/tiktok to connect.' };
+    } else if (tt.expiresAt && new Date(tt.expiresAt) <= now) {
+      results.tiktok = { success: false, error: 'TikTok token expired. Please reconnect.' };
+    } else {
+      try {
+        // TikTok Video Upload: initialize upload
+        const initRes = await axios.post(
+          'https://open.tiktokapis.com/v2/post/publish/video/init/',
+          {
+            post_info: { title: caption || 'Check out this video!', privacy_level: 'PUBLIC_TO_EVERYONE', disable_duet: false, disable_stitch: false, disable_comment: false },
+            source_info: { source: 'PULL_FROM_URL', video_url: videoUrl }
+          },
+          { headers: { 'Authorization': `Bearer ${tt.accessToken}`, 'Content-Type': 'application/json; charset=UTF-8' } }
+        );
+        results.tiktok = { success: true, publishId: initRes.data.data?.publish_id };
+      } catch (err) {
+        results.tiktok = { success: false, error: err.response?.data?.error?.message || err.message };
+      }
+    }
+  }
+
+  // --- FACEBOOK PAGE ---
+  if (platforms.includes('facebook')) {
+    const fb = tokens.facebook || {};
+    if (!fb.accessToken || !fb.pageOrUserId) {
+      results.facebook = { success: false, error: 'Facebook not connected. Visit /api/auth/facebook to connect.' };
+    } else if (fb.expiresAt && new Date(fb.expiresAt) <= now) {
+      results.facebook = { success: false, error: 'Facebook token expired. Please reconnect.' };
+    } else {
+      try {
+        const fbRes = await axios.post(
+          `https://graph.facebook.com/v19.0/${fb.pageOrUserId}/videos`,
+          { file_url: videoUrl, description: caption || '', published: true, access_token: fb.accessToken }
+        );
+        results.facebook = { success: true, videoId: fbRes.data.id };
+      } catch (err) {
+        results.facebook = { success: false, error: err.response?.data?.error?.message || err.message };
+      }
+    }
+  }
+
+  const anySuccess = Object.values(results).some(r => r.success);
+  res.status(anySuccess ? 200 : 422).json({ results });
 });
 
 const PORT = process.env.PORT || 5000;
