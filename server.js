@@ -461,8 +461,8 @@ const userSchema = new mongoose.Schema({
     state:       String,
     postal_code: String,
     country:     String,
-  }
-});
+  },
+
 
   // OAuth tokens for social publishing (Share to Socials feature)
   socialTokens: {
@@ -482,7 +482,8 @@ const userSchema = new mongoose.Schema({
       expiresAt: Date,
       pageOrUserId: String
     }
-  },
+  }
+});
 const User = mongoose.model('User', userSchema);
 
 const Order = mongoose.model('Order', new mongoose.Schema({
