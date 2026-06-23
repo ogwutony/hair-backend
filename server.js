@@ -1270,9 +1270,11 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
       };
     }
     
-    // Update social links if provided
+    // Update social links if provided (atomic $set per field)
     if (socialLinks) {
-      updateData.socialLinks = { ...socialLinks, updatedAt: new Date() };
+      if (socialLinks.instagram !== undefined) updateData['socialLinks.instagram'] = socialLinks.instagram;
+      if (socialLinks.tiktok !== undefined) updateData['socialLinks.tiktok'] = socialLinks.tiktok;
+      if (socialLinks.facebook !== undefined) updateData['socialLinks.facebook'] = socialLinks.facebook;
     }
 
     // Accept avatarUrl directly in profile update
@@ -1286,7 +1288,7 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
       } catch (_) { /* ignore invalid URLs */ }
     }
     
-    const user = await User.findByIdAndUpdate(req.user._id, updateData, { new: true });
+    const user = await User.findByIdAndUpdate(req.user._id, { $set: updateData }, { new: true });
     res.json({ success: true, message: 'Profile updated successfully', profile: {
       perspective: user.perspective,
       socialLinks: user.socialLinks,
@@ -1303,9 +1305,14 @@ app.put('/api/profile/social-links', authMiddleware, async (req, res) => {
   try {
     const { socialLinks } = req.body;
     
+    const updatePayload = {};
+    if (socialLinks.instagram !== undefined) updatePayload['socialLinks.instagram'] = socialLinks.instagram;
+    if (socialLinks.tiktok !== undefined) updatePayload['socialLinks.tiktok'] = socialLinks.tiktok;
+    if (socialLinks.facebook !== undefined) updatePayload['socialLinks.facebook'] = socialLinks.facebook;
+
     const user = await User.findByIdAndUpdate(
       req.user._id,
-      { socialLinks: { ...socialLinks, updatedAt: new Date() } },
+      { $set: updatePayload },
       { new: true }
     );
     
