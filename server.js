@@ -1274,8 +1274,8 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
 // PUT /api/profile - Update user profile perspectives
 app.put('/api/profile', authMiddleware, async (req, res) => {
   try {
-    const { perspective, socialLinks, avatarUrl, systemSettings } = req.body;
-    
+    const { perspective, socialLinks, avatarUrl, avatar, systemSettings } = req.body;
+    const hadAvatarBefore = !!req.user.avatarUrl;
     const updateData = {};
     
     // Update perspective if provided
@@ -1295,17 +1295,17 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
       if (socialLinks.facebook !== undefined) updateData['socialLinks.facebook'] = socialLinks.facebook;
     }
 
-    // Accept avatarUrl directly in profile update
-    if (avatarUrl && typeof avatarUrl === 'string') {
+    // Accept avatarUrl directly in profile update (also accept legacy `avatar` key from older frontend clients)
+    const newAvatarUrl = avatarUrl || avatar;
+    if (newAvatarUrl && typeof newAvatarUrl === 'string') {
       try {
-        const parsed = new URL(avatarUrl);
+        const parsed = new URL(newAvatarUrl);
         if (['http:', 'https:'].includes(parsed.protocol)) {
-          updateData.avatarUrl = avatarUrl;
-          updateData.profilePictureUrl = avatarUrl;
+          updateData.avatarUrl = newAvatarUrl;
+          updateData.profilePictureUrl = newAvatarUrl;
         }
       } catch (_) { /* ignore invalid URLs */ }
     }
-
     // Global toggle updates — only the admin account may commit these
     if (systemSettings !== undefined) {
       if (req.user.email !== 'ogwutony@gmail.com') {
@@ -1317,6 +1317,10 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
     }
     
     const user = await User.findByIdAndUpdate(req.user._id, { $set: updateData }, { new: true });
+    // Award +25 points the first time a user sets an avatar (server-verified, not client-trusted)
+    if (updateData.avatarUrl && !hadAvatarBefore) {
+      await updateRankScore(req.user._id, 25);
+    }
     res.json({ success: true, message: 'Profile updated successfully', profile: {
       perspective: user.perspective,
       socialLinks: user.socialLinks,
