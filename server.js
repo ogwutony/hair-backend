@@ -482,6 +482,23 @@ const userSchema = new mongoose.Schema({
       expiresAt: Date,
       pageOrUserId: String
     }
+  },
+
+  // System / admin settings
+  systemSettings: {
+    adsEnabled: { type: Boolean, default: false }
+  },
+
+  // Ad earnings ledger — one entry per monetised post / profile item
+  accruedAdEarnings: {
+    type: [
+      {
+        postId:    { type: String, required: true },
+        amount:    { type: mongoose.Schema.Types.Decimal128, required: true },
+        recordedAt: { type: Date, default: Date.now }
+      }
+    ],
+    default: []
   }
 });
 const User = mongoose.model('User', userSchema);
@@ -1247,6 +1264,7 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
       subscriptionPlan:   user.subscriptionPlan   || null,
       shipmentCount:      user.shipmentCount       ?? INITIAL_SHIPMENT_COUNT,
       shippingAddress:    user.shippingAddress     || null,
+      systemSettings:     user.systemSettings      || { adsEnabled: false },
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1256,7 +1274,7 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
 // PUT /api/profile - Update user profile perspectives
 app.put('/api/profile', authMiddleware, async (req, res) => {
   try {
-    const { perspective, socialLinks, avatarUrl } = req.body;
+    const { perspective, socialLinks, avatarUrl, systemSettings } = req.body;
     
     const updateData = {};
     
@@ -1287,6 +1305,16 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
         }
       } catch (_) { /* ignore invalid URLs */ }
     }
+
+    // Global toggle updates — only the admin account may commit these
+    if (systemSettings !== undefined) {
+      if (req.user.email !== 'ogwutony@gmail.com') {
+        return res.status(403).json({ error: 'Forbidden: only the admin account may update system settings' });
+      }
+      if (typeof systemSettings.adsEnabled === 'boolean') {
+        updateData['systemSettings.adsEnabled'] = systemSettings.adsEnabled;
+      }
+    }
     
     const user = await User.findByIdAndUpdate(req.user._id, { $set: updateData }, { new: true });
     res.json({ success: true, message: 'Profile updated successfully', profile: {
@@ -1294,6 +1322,7 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
       socialLinks: user.socialLinks,
       avatarUrl: user.avatarUrl,
       profilePictureUrl: user.profilePictureUrl,
+      systemSettings: user.systemSettings,
     }});
   } catch (err) {
     res.status(500).json({ error: err.message });
