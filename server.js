@@ -1328,6 +1328,19 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// GET /api/social/status - returns which social platforms the user has connected
+app.get('/api/social/status', authMiddleware, async (req, res) => {
+    try {
+          const user = req.user;
+          res.json({
+                  instagram: !!(user.socialLinks && user.socialLinks.instagram),
+                  tiktok: !!(user.socialLinks && user.socialLinks.tiktok),
+                  facebook: !!(user.socialLinks && user.socialLinks.facebook)
+          });
+    } catch (err) {
+          res.status(500).json({ error: 'Server error' });
+    }
+});
 
 // PUT /api/profile/social-links - Update only social media links
 app.put('/api/profile/social-links', authMiddleware, async (req, res) => {
