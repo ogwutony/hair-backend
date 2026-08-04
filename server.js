@@ -1229,6 +1229,26 @@ app.post('/api/duma/culture', authMiddleware, async (req, res) => {
   }
 });
 
+// DELETE /api/duma/:id - Allow users to delete their own Duma posts
+app.delete('/api/duma/:id', authMiddleware, async (req, res) => {
+  try {
+    const item = await DumaItem.findById(req.params.id);
+    if (!item) {
+      return res.status(404).json({ error: "Post not found" });
+    }
+
+    // Anti-tamper check: Ensure the requester owns the post
+    if (item.submittedBy !== req.user.email) {
+      return res.status(403).json({ error: "Unauthorized to delete this post" });
+    }
+
+    await DumaItem.findByIdAndDelete(req.params.id);
+    res.json({ success: true, message: "Post deleted successfully" });
+  } catch (err) {
+    res.status(500).json({ error: "Server error deleting post" });
+  }
+});
+
 // GET user rank info
 app.get('/api/rank', authMiddleware, async (req, res) => {
   const user = req.user;
