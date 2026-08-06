@@ -249,6 +249,10 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'Cookie']
 }));
 
+// Admin routes
+const adminRouter = require('./routes/admin');
+app.use(adminRouter);
+
 // File upload configuration
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -503,14 +507,7 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 
-const Order = mongoose.model('Order', new mongoose.Schema({
-  userEmail:             { type: String, required: true },
-  items:                 { type: Object, required: true },
-  totalPrice:            { type: Number, required: true },
-  status:                { type: String, default: 'Pending' },
-  stripePaymentIntentId: String,
-  createdAt:             { type: Date, default: Date.now }
-}));
+const Order = require('./models/Order');
 
 // Duma (formerly Legislature) submissions
 const dumaSchema = new mongoose.Schema({
