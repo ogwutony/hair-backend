@@ -430,6 +430,9 @@ const userSchema = new mongoose.Schema({
   rank_rewards_sent: { type: [String], default: [] }, // Track which ranks already rewarded
   avatarUrl: { type: String, default: null }, // Profile avatar image URL
   profilePictureUrl: { type: String, default: null }, // Profile picture URL (canonical)
+  displayName: { type: String, default: "" },
+  location:    { type: String, default: "" },
+  avatarSlots: { type: [String], default: [null, null, null, null, null, null] },
   
   // Profile perspectives (4-box layout)
   perspective: {
@@ -541,6 +544,8 @@ const dumaSchema = new mongoose.Schema({
     facebook: String
   },
   submitterAvatar: String, // Cloudinary URL captured from the request at submission time
+  location: { type: String, default: "" },
+  submitterDisplayName: { type: String, default: "" },
   votes:      { yay: { type: Number, default: 0 }, nay: { type: Number, default: 0 } },
   createdAt:  { type: Date, default: Date.now }
 });
@@ -1194,7 +1199,7 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
 // 5. Submit culture video/perspective to Duma
 app.post('/api/duma/culture', authMiddleware, async (req, res) => {
   try {
-    const { prompt, response, videoUrl, perspective, category, submitterAvatar } = req.body;
+    const { prompt, response, videoUrl, perspective, category, submitterAvatar, location } = req.body;
     const rankTitle = req.user.rank_title || getRankTitle(req.user.rank_score || 1);
     const isVideoSubmission = Boolean(videoUrl);
 
@@ -1211,6 +1216,8 @@ app.post('/api/duma/culture', authMiddleware, async (req, res) => {
       submitterProfilePictureUrl: resolveProfilePictureUrl(req.user),
       submitterSocialLinks: req.user.socialLinks || DEFAULT_SOCIAL_LINKS,
       submitterAvatar: submitterAvatar || resolveProfilePictureUrl(req.user)
+      location: location || "",
+      submitterDisplayName: req.user.displayName || req.user.email,
     });
 
     // Award +100 pts for video submissions, +1 pt for text-only
@@ -1285,6 +1292,9 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
       shipmentCount:      user.shipmentCount       ?? INITIAL_SHIPMENT_COUNT,
       shippingAddress:    user.shippingAddress     || null,
       systemSettings:     user.systemSettings      || { adsEnabled: false },
+      displayName: user.displayName || "",
+      location: user.location || "",
+      avatarSlots: user.avatarSlots || [null, null, null, null, null, null],
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1294,7 +1304,7 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
 // PUT /api/profile - Update user profile perspectives
 app.put('/api/profile', authMiddleware, async (req, res) => {
   try {
-    const { perspective, socialLinks, avatarUrl, avatar, systemSettings } = req.body;
+    const { perspective, socialLinks, avatarUrl, avatar, systemSettings, displayName, location, avatarSlots } = req.body;
     const hadAvatarBefore = !!req.user.avatarUrl;
     const updateData = {};
     
@@ -1326,6 +1336,9 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
         }
       } catch (_) { /* ignore invalid URLs */ }
     }
+    if (displayName !== undefined) updateData.displayName = displayName;
+    if (location !== undefined) updateData.location = location;
+    if (avatarSlots !== undefined) updateData.avatarSlots = avatarSlots;
     // Global toggle updates — only the admin account may commit these
     if (systemSettings !== undefined) {
       if (req.user.email !== 'ogwutony@gmail.com') {
@@ -1347,6 +1360,9 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
       avatarUrl: user.avatarUrl,
       profilePictureUrl: user.profilePictureUrl,
       systemSettings: user.systemSettings,
+      displayName: user.displayName,
+      location: user.location,
+      avatarSlots: user.avatarSlots,
     }});
   } catch (err) {
     res.status(500).json({ error: err.message });
