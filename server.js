@@ -1219,7 +1219,7 @@ app.post('/api/duma/culture', authMiddleware, async (req, res) => {
       submitterId: req.user._id,
       submitterProfilePictureUrl: resolveProfilePictureUrl(req.user),
       submitterSocialLinks: req.user.socialLinks || DEFAULT_SOCIAL_LINKS,
-      submitterAvatar: submitterAvatar || resolveProfilePictureUrl(req.user)
+      submitterAvatar: submitterAvatar || resolveProfilePictureUrl(req.user),
       location: location || "",
       submitterDisplayName: req.user.displayName || req.user.email,
     });
