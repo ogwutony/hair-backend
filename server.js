@@ -1042,13 +1042,15 @@ app.get('/api/duma', async (req, res) => {
     const submitterEmails = [...new Set(items.map(i => i.submittedBy).filter(Boolean))];
     const submitters = await User.find(
       { email: { $in: submitterEmails } },
-      'email profilePictureUrl avatarUrl socialLinks'
+            'email profilePictureUrl avatarUrl socialLinks displayName location'
     );
     const submitterMap = {};
     for (const u of submitters) {
       submitterMap[u.email] = {
         profilePictureUrl: resolveProfilePictureUrl(u),
-        socialLinks: u.socialLinks || DEFAULT_SOCIAL_LINKS
+        socialLinks: u.socialLinks || DEFAULT_SOCIAL_LINKS,
+          displayName: u.displayName || "",
+          location: u.location || ""
       };
     }
 
@@ -1057,7 +1059,9 @@ app.get('/api/duma', async (req, res) => {
       return {
         ...item.toObject(),
         submitterProfilePictureUrl: profile.profilePictureUrl || item.submitterProfilePictureUrl || null,
-        submitterSocialLinks: profile.socialLinks || item.submitterSocialLinks || DEFAULT_SOCIAL_LINKS
+        submitterSocialLinks: profile.socialLinks || item.submitterSocialLinks || DEFAULT_SOCIAL_LINKS,
+          submitterDisplayName: profile.displayName || item.submitterDisplayName || "",
+          location: item.location || profile.location || ""
       };
     });
 
