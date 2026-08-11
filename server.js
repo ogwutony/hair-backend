@@ -546,6 +546,7 @@ const dumaSchema = new mongoose.Schema({
   submitterAvatar: String, // Cloudinary URL captured from the request at submission time
   location: { type: String, default: "" },
   submitterDisplayName: { type: String, default: "" },
+  mediaUrls: { type: [String], default: [] },
   votes:      { yay: { type: Number, default: 0 }, nay: { type: Number, default: 0 } },
   createdAt:  { type: Date, default: Date.now }
 });
@@ -1203,7 +1204,7 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
 // 5. Submit culture video/perspective to Duma
 app.post('/api/duma/culture', authMiddleware, async (req, res) => {
   try {
-    const { prompt, response, videoUrl, perspective, category, submitterAvatar, location } = req.body;
+    const { prompt, response, videoUrl, perspective, category, submitterAvatar, location, mediaUrls } = req.body;
     const rankTitle = req.user.rank_title || getRankTitle(req.user.rank_score || 1);
     const isVideoSubmission = Boolean(videoUrl);
 
@@ -1222,6 +1223,7 @@ app.post('/api/duma/culture', authMiddleware, async (req, res) => {
       submitterAvatar: submitterAvatar || resolveProfilePictureUrl(req.user),
       location: location || "",
       submitterDisplayName: req.user.displayName || req.user.email,
+      mediaUrls: mediaUrls || [],
     });
 
     // Award +100 pts for video submissions, +1 pt for text-only
