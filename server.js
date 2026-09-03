@@ -1,4 +1,5 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
@@ -1724,8 +1725,17 @@ app.get('/api/partner/premium/status', requireBearerAuthorizationHeader, authMid
 
 // ========== BRAND SPONSORED PLACEMENTS ==========
 
+// Rate limiter to protect the sponsor analytics endpoints from abuse/spam.
+const sponsorRateLimit = (maxRequests = 30, windowMs = 60 * 1000) => rateLimit({
+  windowMs,
+  max: maxRequests,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again later.' }
+});
+
 // GET /api/sponsor/campaigns — public list of active sponsored placements for the feed
-app.get('/api/sponsor/campaigns', async (req, res) => {
+app.get('/api/sponsor/campaigns', sponsorRateLimit(), async (req, res) => {
   try {
     const campaigns = await SponsorCampaign.find({ active: true })
       .select('companyName name imageUrl description ctaText ctaUrl')
@@ -1738,10 +1748,12 @@ app.get('/api/sponsor/campaigns', async (req, res) => {
 });
 
 // POST /api/sponsor/view — fires when a SponsoredCard intersects the viewport
-app.post('/api/sponsor/view', async (req, res) => {
+app.post('/api/sponsor/view', sponsorRateLimit(60), async (req, res) => {
   try {
     const { campaignId } = req.body;
-    if (!campaignId) return res.status(400).json({ error: 'campaignId is required' });
+    if (!campaignId || !mongoose.Types.ObjectId.isValid(campaignId)) {
+      return res.status(400).json({ error: 'A valid campaignId is required' });
+    }
     const campaign = await SponsorCampaign.findByIdAndUpdate(campaignId, { $inc: { views: 1 } }, { new: true });
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
     res.json({ success: true, views: campaign.views });
@@ -1751,10 +1763,12 @@ app.post('/api/sponsor/view', async (req, res) => {
 });
 
 // POST /api/sponsor/click — fires when a user clicks the call-to-action on a SponsoredCard
-app.post('/api/sponsor/click', async (req, res) => {
+app.post('/api/sponsor/click', sponsorRateLimit(60), async (req, res) => {
   try {
     const { campaignId } = req.body;
-    if (!campaignId) return res.status(400).json({ error: 'campaignId is required' });
+    if (!campaignId || !mongoose.Types.ObjectId.isValid(campaignId)) {
+      return res.status(400).json({ error: 'A valid campaignId is required' });
+    }
     const campaign = await SponsorCampaign.findByIdAndUpdate(campaignId, { $inc: { clicks: 1 } }, { new: true });
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
     res.json({ success: true, clicks: campaign.clicks });
@@ -1764,7 +1778,7 @@ app.post('/api/sponsor/click', async (req, res) => {
 });
 
 // POST /api/sponsor/campaigns — Brand Partners create a new sponsored placement
-app.post('/api/sponsor/campaigns', authMiddleware, requireBrandPartner, async (req, res) => {
+app.post('/api/sponsor/campaigns', sponsorRateLimit(20), authMiddleware, requireBrandPartner, async (req, res) => {
   try {
     const { name, imageUrl, description, ctaText, ctaUrl } = req.body;
     if (!name || !ctaUrl) return res.status(400).json({ error: 'name and ctaUrl are required' });
@@ -1784,7 +1798,7 @@ app.post('/api/sponsor/campaigns', authMiddleware, requireBrandPartner, async (r
 });
 
 // GET /api/sponsor/dashboard — Brand Partner analytics dashboard (own campaigns only)
-app.get('/api/sponsor/dashboard', authMiddleware, requireBrandPartner, async (req, res) => {
+app.get('/api/sponsor/dashboard', sponsorRateLimit(30), authMiddleware, requireBrandPartner, async (req, res) => {
   try {
     const campaigns = await SponsorCampaign.find({ brandEmail: req.user.email }).sort({ createdAt: -1 });
     const activeCampaigns = campaigns.filter(c => c.active).length;

@@ -2106,6 +2106,17 @@ const injectSponsoredCards = (items, campaigns, interval = 6) => {
   return result;
 };
 
+// Fetches active sponsored placements once for use in feed injection.
+const useSponsoredCampaigns = () => {
+  const [sponsoredCampaigns, setSponsoredCampaigns] = useState([]);
+  useEffect(() => {
+    fetch(`${BACKEND_URL}/api/sponsor/campaigns`).then(r => r.json()).then(data => {
+      if (Array.isArray(data)) setSponsoredCampaigns(data);
+    }).catch(() => {});
+  }, []);
+  return sponsoredCampaigns;
+};
+
 // --- DUMA PAGE ---
 const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoints }) => {
   const [dumaItems, setDumaItems] = useState(items);
@@ -2115,7 +2126,7 @@ const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoin
   const [comments, setComments] = useState({});
   const [commentText, setCommentText] = useState({});
   const [activeSection, setActiveSection] = useState("Culture");
-  const [sponsoredCampaigns, setSponsoredCampaigns] = useState([]);
+  const sponsoredCampaigns = useSponsoredCampaigns();
   
   useEffect(() => { 
     fetch(`${BACKEND_URL}/api/duma`).then(r => r.json()).then(data => { 
@@ -2123,12 +2134,6 @@ const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoin
     }).catch(() => {}); 
   }, [items]);
 
-  useEffect(() => {
-    fetch(`${BACKEND_URL}/api/sponsor/campaigns`).then(r => r.json()).then(data => {
-      if (Array.isArray(data)) setSponsoredCampaigns(data);
-    }).catch(() => {});
-  }, []);
-  
   const handleVote = async (itemId, voteType) => {
     if (!authToken) return alert("Please log in to vote.");
     if (userVotes[itemId]) return; // Already voted
@@ -2405,13 +2410,7 @@ const PerspectivesPage = ({ items, authToken, userEmail, rankTitle, rankScore, f
   const [followingList, setFollowingList] = useState([]);
   const [selectedFollowing, setSelectedFollowing] = useState(following || []);
   const [filteredItems, setFilteredItems] = useState(items);
-  const [sponsoredCampaigns, setSponsoredCampaigns] = useState([]);
-
-  useEffect(() => {
-    fetch(`${BACKEND_URL}/api/sponsor/campaigns`).then(r => r.json()).then(data => {
-      if (Array.isArray(data)) setSponsoredCampaigns(data);
-    }).catch(() => {});
-  }, []);
+  const sponsoredCampaigns = useSponsoredCampaigns();
 
   useEffect(() => {
     // Extract unique submitters from Duma posts
