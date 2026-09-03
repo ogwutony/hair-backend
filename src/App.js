@@ -2032,6 +2032,91 @@ const CultureLabPage = ({ addDumaItem, userEmail, rankTitle, rankScore, authToke
   );
 };
 
+// --- SPONSORED CARD (Brand Sponsored-Placement) ---
+// Renders a brand-sponsored placement inline in a feed. Fires a view analytics
+// event the first time the card intersects the viewport, and a click event
+// whenever the user activates the call-to-action.
+const SponsoredCard = ({ campaign }) => {
+  const cardRef = React.useRef(null);
+  const hasFiredView = React.useRef(false);
+
+  useEffect(() => {
+    const node = cardRef.current;
+    if (!node || typeof IntersectionObserver === 'undefined') return;
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting && !hasFiredView.current) {
+          hasFiredView.current = true;
+          fetch(`${BACKEND_URL}/api/sponsor/view`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ campaignId: campaign.id || campaign._id })
+          }).catch(() => {});
+          observer.disconnect();
+        }
+      });
+    }, { threshold: 0.5 });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [campaign]);
+
+  const handleCtaClick = () => {
+    fetch(`${BACKEND_URL}/api/sponsor/click`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ campaignId: campaign.id || campaign._id })
+    }).catch(() => {});
+    if (campaign.ctaUrl) window.open(campaign.ctaUrl, '_blank', 'noopener,noreferrer');
+  };
+
+  return (
+    <div ref={cardRef} style={{ ...styles.dumaCard, border: '1px solid #f0d9a8', backgroundColor: '#fffdf7' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
+        <span style={{ ...styles.typeTag, backgroundColor: '#f5c542', color: '#222' }}>Sponsored</span>
+        <span style={{ fontSize: '11px', color: '#999' }}>{campaign.companyName}</span>
+      </div>
+      {campaign.imageUrl && (
+        <img src={campaign.imageUrl} alt={campaign.name} style={{ width: '100%', maxHeight: '220px', objectFit: 'cover', borderRadius: '8px', marginBottom: '12px' }} />
+      )}
+      <h4 style={{ marginTop: 0, marginBottom: '8px' }}>{campaign.name}</h4>
+      {campaign.description && <p style={{ color: '#666', fontSize: '13px', marginBottom: '14px' }}>{campaign.description}</p>}
+      <button onClick={handleCtaClick} style={{ ...styles.authButton, width: 'auto', padding: '10px 20px' }}>
+        {campaign.ctaText || 'Learn More'}
+      </button>
+    </div>
+  );
+};
+
+// Inserts a SponsoredCard placeholder into `items` every `interval` posts,
+// cycling through the available `campaigns`. Returns a new array of
+// { type: 'post' | 'sponsored', data } entries for rendering.
+const injectSponsoredCards = (items, campaigns, interval = 6) => {
+  if (!campaigns || campaigns.length === 0) {
+    return items.map(item => ({ type: 'post', data: item }));
+  }
+  const result = [];
+  let campaignIndex = 0;
+  items.forEach((item, idx) => {
+    result.push({ type: 'post', data: item });
+    if ((idx + 1) % interval === 0) {
+      result.push({ type: 'sponsored', data: campaigns[campaignIndex % campaigns.length] });
+      campaignIndex += 1;
+    }
+  });
+  return result;
+};
+
+// Fetches active sponsored placements once for use in feed injection.
+const useSponsoredCampaigns = () => {
+  const [sponsoredCampaigns, setSponsoredCampaigns] = useState([]);
+  useEffect(() => {
+    fetch(`${BACKEND_URL}/api/sponsor/campaigns`).then(r => r.json()).then(data => {
+      if (Array.isArray(data)) setSponsoredCampaigns(data);
+    }).catch(() => {});
+  }, []);
+  return sponsoredCampaigns;
+};
+
 // --- DUMA PAGE ---
 const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoints }) => {
   const [dumaItems, setDumaItems] = useState(items);
@@ -2041,13 +2126,14 @@ const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoin
   const [comments, setComments] = useState({});
   const [commentText, setCommentText] = useState({});
   const [activeSection, setActiveSection] = useState("Culture");
+  const sponsoredCampaigns = useSponsoredCampaigns();
   
   useEffect(() => { 
     fetch(`${BACKEND_URL}/api/duma`).then(r => r.json()).then(data => { 
       if (Array.isArray(data) && data.length > 0) setDumaItems([...data, ...items]); 
     }).catch(() => {}); 
   }, [items]);
-  
+
   const handleVote = async (itemId, voteType) => {
     if (!authToken) return alert("Please log in to vote.");
     if (userVotes[itemId]) return; // Already voted
@@ -2088,6 +2174,8 @@ const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoin
 
   const culturalItems = dumaItems.filter(item => item.section === "Cultural" || item.category === "Culture" || item.type === "Video" || item.type === "Culture");
   const commerceItems = dumaItems.filter(item => item.section === "Commerce" || (item.type === "Recommendation" || item.type === "Partner"));
+  const culturalFeed = injectSponsoredCards(culturalItems, sponsoredCampaigns);
+  const commerceFeed = injectSponsoredCards(commerceItems, sponsoredCampaigns);
   
   return (
     <div style={{ padding: '40px 60px', maxWidth: '1100px', margin: '0 auto' }}>
@@ -2106,10 +2194,15 @@ const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoin
       
       {activeSection === "Culture" && (
         <div>
-          {culturalItems.length === 0 ? (
+          {culturalFeed.length === 0 ? (
             <div style={{ ...styles.dumaCard, textAlign: 'center', color: '#888' }}>No perspectives shared yet. Share yours and contribute to our culture section!</div>
           ) : (
-            culturalItems.map(item => (
+            culturalFeed.map((entry, feedIdx) => {
+              if (entry.type === 'sponsored') {
+                return <SponsoredCard key={`sponsored-culture-${feedIdx}`} campaign={entry.data} />;
+              }
+              const item = entry.data;
+              return (
               <div key={item.id || item._id} style={styles.dumaCard}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
                   <span style={styles.typeTag}>Perspective</span>
@@ -2161,17 +2254,23 @@ const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoin
                   </div>
                 )}
               </div>
-            ))
+              );
+            })
           )}
         </div>
       )}
       
       {activeSection === "Commerce" && (
         <div>
-          {commerceItems.length === 0 ? (
+          {commerceFeed.length === 0 ? (
             <div style={{ ...styles.dumaCard, textAlign: 'center', color: '#888' }}>No submissions yet. Be the first to recommend a product or partnership!</div>
           ) : (
-            commerceItems.map(item => (
+            commerceFeed.map((entry, feedIdx) => {
+              if (entry.type === 'sponsored') {
+                return <SponsoredCard key={`sponsored-commerce-${feedIdx}`} campaign={entry.data} />;
+              }
+              const item = entry.data;
+              return (
               <div key={item.id || item._id} style={styles.dumaCard}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
                   <span style={styles.typeTag}>{item.type}</span>
@@ -2297,7 +2396,8 @@ const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoin
                   </div>
                 )}
               </div>
-            ))
+              );
+            })
           )}
         </div>
       )}
@@ -2310,6 +2410,7 @@ const PerspectivesPage = ({ items, authToken, userEmail, rankTitle, rankScore, f
   const [followingList, setFollowingList] = useState([]);
   const [selectedFollowing, setSelectedFollowing] = useState(following || []);
   const [filteredItems, setFilteredItems] = useState(items);
+  const sponsoredCampaigns = useSponsoredCampaigns();
 
   useEffect(() => {
     // Extract unique submitters from Duma posts
@@ -2394,7 +2495,12 @@ const PerspectivesPage = ({ items, authToken, userEmail, rankTitle, rankScore, f
             No perspectives yet from people you follow.
           </div>
         ) : (
-          filteredItems.map(item => (
+          injectSponsoredCards(filteredItems, sponsoredCampaigns).map((entry, feedIdx) => {
+            if (entry.type === 'sponsored') {
+              return <SponsoredCard key={`sponsored-perspectives-${feedIdx}`} campaign={entry.data} />;
+            }
+            const item = entry.data;
+            return (
             <div key={item.id || item._id} style={styles.dumaCard}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
                 <span style={styles.typeTag}>Perspective</span>
@@ -2404,9 +2510,106 @@ const PerspectivesPage = ({ items, authToken, userEmail, rankTitle, rankScore, f
               <h4 style={{ marginTop: '12px', marginBottom: '8px', color: '#555' }}>Prompt: "{item.prompt || 'What makes a person beautiful?'}"</h4>
               <p style={{ color: '#222', fontSize: '14px', lineHeight: '1.6' }}>{item.response || item.reason || item.desc}</p>
             </div>
-          ))
+            );
+          })
         )}
       </div>
+    </div>
+  );
+};
+
+// --- BRAND DASHBOARD PAGE (protected: approved Brand Partners only) ---
+const BrandDashboardPage = ({ authToken, isBrandPartner, isLoggedIn }) => {
+  const [dashboard, setDashboard] = useState(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!authToken || !isBrandPartner) { setLoading(false); return; }
+    fetch(`${BACKEND_URL}/api/sponsor/dashboard`, { headers: { Authorization: `Bearer ${authToken}` } })
+      .then(async r => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Failed to load dashboard.');
+        return data;
+      })
+      .then(data => setDashboard(data))
+      .catch(err => setError(err.message))
+      .finally(() => setLoading(false));
+  }, [authToken, isBrandPartner]);
+
+  if (!isLoggedIn) {
+    return (
+      <div style={{ padding: '60px', textAlign: 'center' }}>
+        <h2>Brand Dashboard</h2>
+        <p style={{ color: '#666' }}>Please <Link to="/login">log in</Link> to access the Brand Dashboard.</p>
+      </div>
+    );
+  }
+
+  if (!isBrandPartner) {
+    return (
+      <div style={{ padding: '60px', textAlign: 'center' }}>
+        <h2>Brand Dashboard</h2>
+        <p style={{ color: '#666' }}>This area is restricted to approved Brand Partner accounts.</p>
+      </div>
+    );
+  }
+
+  if (loading) {
+    return <div style={{ padding: '60px', textAlign: 'center', color: '#888' }}>Loading dashboard...</div>;
+  }
+
+  if (error) {
+    return <div style={{ padding: '60px', textAlign: 'center', color: '#e74c3c' }}>{error}</div>;
+  }
+
+  const totals = dashboard?.totals || { activeCampaigns: 0, totalViews: 0, totalClicks: 0, ctr: 0 };
+  const campaigns = dashboard?.campaigns || [];
+
+  return (
+    <div style={{ padding: '40px 60px', maxWidth: '1100px', margin: '0 auto' }}>
+      <h2 style={{ marginBottom: '6px' }}>Brand Dashboard</h2>
+      <p style={{ color: '#666', fontSize: '14px', marginBottom: '30px' }}>Performance metrics for your sponsored placements.</p>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px', marginBottom: '30px' }}>
+        <div style={styles.dumaCard}>
+          <p style={{ fontSize: '12px', color: '#888', margin: '0 0 6px 0', fontWeight: '600' }}>Active Campaigns</p>
+          <p style={{ fontSize: '28px', margin: 0, fontWeight: '700' }}>{totals.activeCampaigns}</p>
+        </div>
+        <div style={styles.dumaCard}>
+          <p style={{ fontSize: '12px', color: '#888', margin: '0 0 6px 0', fontWeight: '600' }}>Total Impressions</p>
+          <p style={{ fontSize: '28px', margin: 0, fontWeight: '700' }}>{totals.totalViews}</p>
+        </div>
+        <div style={styles.dumaCard}>
+          <p style={{ fontSize: '12px', color: '#888', margin: '0 0 6px 0', fontWeight: '600' }}>Total Clicks</p>
+          <p style={{ fontSize: '28px', margin: 0, fontWeight: '700' }}>{totals.totalClicks}</p>
+        </div>
+        <div style={styles.dumaCard}>
+          <p style={{ fontSize: '12px', color: '#888', margin: '0 0 6px 0', fontWeight: '600' }}>Click-Through Rate</p>
+          <p style={{ fontSize: '28px', margin: 0, fontWeight: '700' }}>{totals.ctr}%</p>
+        </div>
+      </div>
+
+      <h3 style={{ marginBottom: '16px' }}>Placements ({campaigns.length})</h3>
+      {campaigns.length === 0 ? (
+        <div style={{ ...styles.dumaCard, textAlign: 'center', color: '#888' }}>No sponsored placements yet.</div>
+      ) : (
+        campaigns.map(c => (
+          <div key={c.id} style={styles.dumaCard}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div>
+                <h4 style={{ margin: '0 0 4px 0' }}>{c.name}</h4>
+                <span style={{ fontSize: '12px', color: c.active ? '#27ae60' : '#999' }}>{c.active ? 'Active' : 'Inactive'}</span>
+              </div>
+              <div style={{ display: 'flex', gap: '20px', fontSize: '13px', color: '#666' }}>
+                <span>Views: <strong>{c.views}</strong></span>
+                <span>Clicks: <strong>{c.clicks}</strong></span>
+                <span>CTR: <strong>{c.ctr}%</strong></span>
+              </div>
+            </div>
+          </div>
+        ))
+      )}
     </div>
   );
 };
@@ -2422,6 +2625,7 @@ export default function App() {
   const [userAvatar, setUserAvatar] = useState("");
   const [dumaItems, setDumaItems] = useState([{ id: 1, type: "Partner", company: "EcoHair Labs", product: "Silk Serum", desc: "Organic serum for hair.", section: "Commerce", submitterRank: "Comrade" }]);
   const [following, setFollowing] = useState([]);
+  const [isBrandPartner, setIsBrandPartner] = useState(false);
   useEffect(() => {
     const token = localStorage.getItem("authToken") || sessionStorage.getItem("authToken");
     const email = localStorage.getItem("userEmail") || sessionStorage.getItem("userEmail");
@@ -2431,7 +2635,7 @@ export default function App() {
     if (storedAvatar) setUserAvatar(storedAvatar);
     if (token) {
       fetch(`${BACKEND_URL}/api/auth/me`, { headers: { Authorization: `Bearer ${token}` } }).then(r => r.json()).then(data => {
-        if (data.email) { setIsLoggedIn(true); setUserEmail(data.email); setAuthToken(token); setRankTitle(data.rank_title || 'Comrade'); setRankScore(data.rank_score || 1); localStorage.removeItem("rankTitle"); localStorage.removeItem("rankScore"); sessionStorage.removeItem("rankTitle"); sessionStorage.removeItem("rankScore"); } else { localStorage.removeItem("authToken"); localStorage.removeItem("userEmail"); sessionStorage.removeItem("authToken"); sessionStorage.removeItem("userEmail"); }
+        if (data.email) { setIsLoggedIn(true); setUserEmail(data.email); setAuthToken(token); setRankTitle(data.rank_title || 'Comrade'); setRankScore(data.rank_score || 1); setIsBrandPartner(!!data.isBrandPartner); localStorage.removeItem("rankTitle"); localStorage.removeItem("rankScore"); sessionStorage.removeItem("rankTitle"); sessionStorage.removeItem("rankScore"); } else { localStorage.removeItem("authToken"); localStorage.removeItem("userEmail"); sessionStorage.removeItem("authToken"); sessionStorage.removeItem("userEmail"); }
       }).catch(() => { if (email) { setIsLoggedIn(true); setUserEmail(email); setAuthToken(token); const storedRank = localStorage.getItem("rankTitle") || sessionStorage.getItem("rankTitle"); const storedScore = parseInt(localStorage.getItem("rankScore") || sessionStorage.getItem("rankScore") || "1"); if (storedRank) setRankTitle(storedRank); setRankScore(storedScore); } });
     }
   }, []);
@@ -2440,7 +2644,7 @@ export default function App() {
     const storage = rememberMe ? localStorage : sessionStorage; storage.setItem("authToken", token); storage.setItem("userEmail", email); storage.setItem("rankTitle", resolvedRank); storage.setItem("rankScore", String(resolvedScore));
   };
   const handleLogout = () => {
-    setIsLoggedIn(false); setUserEmail(""); setAuthToken(""); setRankTitle("Comrade"); setRankScore(1); setUserAvatar("");
+    setIsLoggedIn(false); setUserEmail(""); setAuthToken(""); setRankTitle("Comrade"); setRankScore(1); setUserAvatar(""); setIsBrandPartner(false);
     localStorage.removeItem("authToken"); localStorage.removeItem("userEmail"); localStorage.removeItem("rankTitle"); localStorage.removeItem("rankScore"); localStorage.removeItem("userAvatar");
     sessionStorage.removeItem("authToken"); sessionStorage.removeItem("userEmail"); sessionStorage.removeItem("rankTitle"); sessionStorage.removeItem("rankScore"); sessionStorage.removeItem("userAvatar");
   };
@@ -2503,6 +2707,7 @@ export default function App() {
                 <Link to="/partner" style={styles.navLink}>Partner</Link>
                 <Link to="/duma" style={styles.navLink}>The Duma</Link>
                 <Link to="/perspectives" style={styles.navLink}>Culture</Link>
+                {isBrandPartner && <Link to="/brand-dashboard" style={styles.navLink}>Brand Dashboard</Link>}
                 <div style={{ display: 'flex', alignItems: 'center', gap: '15px', borderLeft: '1px solid #eee', paddingLeft: '15px' }}>
                   <Link to="/profile" style={{ ...styles.navLink, fontWeight: '700' }}>Profile</Link>
                   {rankTitle && <RankBadge rankTitle={rankTitle} />}
@@ -2533,6 +2738,7 @@ export default function App() {
           <Route path="/perspectives" element={<PerspectivesPage items={dumaItems} authToken={authToken} userEmail={userEmail} rankTitle={rankTitle} rankScore={rankScore} following={following} onFollowUser={followUser} onUnfollowUser={unfollowUser} onAddPoints={addPoints} />} />
           <Route path="/legislature" element={<DumaPage items={dumaItems} authToken={authToken} userEmail={userEmail} rankTitle={rankTitle} rankScore={rankScore} onAddPoints={addPoints} />} />
           <Route path="/profile" element={<ProfilePage userEmail={userEmail} savedSets={savedSets} rankTitle={rankTitle} rankScore={rankScore} authToken={authToken} onAddPoints={addPoints} userAvatar={userAvatar} onAvatarUpdate={handleAvatarUpdate} />} />
+          <Route path="/brand-dashboard" element={<BrandDashboardPage authToken={authToken} isBrandPartner={isBrandPartner} isLoggedIn={isLoggedIn} />} />
           <Route path="/orders" element={<div style={{ padding: '60px', textAlign: 'center' }}><h2>Payment Received!</h2><p>Your custom hair set is being prepared. Check your Profile to see your formula.</p><Link to="/profile">Go to Profile</Link></div>} />
         </Routes>
       </div>

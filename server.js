@@ -1,4 +1,5 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
@@ -356,6 +357,18 @@ const requirePartnerPremium = async (req, res, next) => {
   next();
 };
 
+// Middleware: requires the authenticated user to hold an approved Brand Partner role
+const requireBrandPartner = async (req, res, next) => {
+  // Depends on authMiddleware having run first to populate req.user
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  if (req.user.brandPartner?.status !== 'approved') {
+    return res.status(403).json({ error: 'Access denied. This feature requires an approved Brand Partner account.' });
+  }
+  next();
+};
+
 // --- MongoDB Models API Integration ---
 const MONGODB_MODELS_API_KEY = process.env.MONGODB_MODELS_API_KEY;
 const MONGODB_MODELS_BASE_URL = 'https://api.mongodb.com/app/data/v1';
@@ -492,6 +505,13 @@ const userSchema = new mongoose.Schema({
     adsEnabled: { type: Boolean, default: false }
   },
 
+  // Brand Partner program — grants access to the Brand Dashboard & sponsored placements
+  brandPartner: {
+    status:      { type: String, enum: ['none', 'pending', 'approved'], default: 'none' },
+    companyName: { type: String, default: "" },
+    approvedAt:  { type: Date, default: null }
+  },
+
   // Ad earnings ledger — one entry per monetised post / profile item
   accruedAdEarnings: {
     type: [
@@ -579,6 +599,22 @@ const voteSchema = new mongoose.Schema({
 });
 voteSchema.index({ userId: 1, targetId: 1 }, { unique: true });
 const Vote = mongoose.model('Vote', voteSchema);
+
+// Sponsored placement campaigns — powers the Brand Sponsored-Placement feature
+const sponsorCampaignSchema = new mongoose.Schema({
+  brandEmail: { type: String, required: true, index: true }, // owning Brand Partner account
+  companyName: { type: String, required: true },
+  name:        { type: String, required: true },
+  imageUrl:    { type: String, default: "" },
+  description: { type: String, default: "" },
+  ctaText:     { type: String, default: "Learn More" },
+  ctaUrl:      { type: String, required: true },
+  active:      { type: Boolean, default: true },
+  views:       { type: Number, default: 0 },
+  clicks:      { type: Number, default: 0 },
+  createdAt:   { type: Date, default: Date.now }
+});
+const SponsorCampaign = mongoose.model('SponsorCampaign', sponsorCampaignSchema);
 
 // Shopify webhook event log — prevents double point awards on redelivered webhooks
 const shopifyWebhookEventSchema = new mongoose.Schema({
@@ -823,7 +859,8 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     email: user.email,
     rank_score: user.rank_score,
     rank_title: user.rank_title || getRankTitle(user.rank_score || 1),
-    isPolitburoOrHigher: isPolitburoOrHigher(user.rank_score || 1)
+    isPolitburoOrHigher: isPolitburoOrHigher(user.rank_score || 1),
+    isBrandPartner: user.brandPartner?.status === 'approved'
   });
 });
 
@@ -1684,6 +1721,104 @@ app.get('/api/partner/premium/status', requireBearerAuthorizationHeader, authMid
     rank_title: req.user.rank_title,
     message: 'You have Partner Premium access.'
   });
+});
+
+// ========== BRAND SPONSORED PLACEMENTS ==========
+
+// Rate limiter to protect the sponsor analytics endpoints from abuse/spam.
+const sponsorRateLimit = (maxRequests = 30, windowMs = 60 * 1000) => rateLimit({
+  windowMs,
+  max: maxRequests,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again later.' }
+});
+
+// GET /api/sponsor/campaigns — public list of active sponsored placements for the feed
+app.get('/api/sponsor/campaigns', sponsorRateLimit(), async (req, res) => {
+  try {
+    const campaigns = await SponsorCampaign.find({ active: true })
+      .select('companyName name imageUrl description ctaText ctaUrl')
+      .sort({ createdAt: -1 })
+      .limit(20);
+    res.json(campaigns);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sponsor/view — fires when a SponsoredCard intersects the viewport
+app.post('/api/sponsor/view', sponsorRateLimit(60), async (req, res) => {
+  try {
+    const { campaignId } = req.body;
+    if (!campaignId || !mongoose.Types.ObjectId.isValid(campaignId)) {
+      return res.status(400).json({ error: 'A valid campaignId is required' });
+    }
+    const campaign = await SponsorCampaign.findByIdAndUpdate(campaignId, { $inc: { views: 1 } }, { new: true });
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    res.json({ success: true, views: campaign.views });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sponsor/click — fires when a user clicks the call-to-action on a SponsoredCard
+app.post('/api/sponsor/click', sponsorRateLimit(60), async (req, res) => {
+  try {
+    const { campaignId } = req.body;
+    if (!campaignId || !mongoose.Types.ObjectId.isValid(campaignId)) {
+      return res.status(400).json({ error: 'A valid campaignId is required' });
+    }
+    const campaign = await SponsorCampaign.findByIdAndUpdate(campaignId, { $inc: { clicks: 1 } }, { new: true });
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    res.json({ success: true, clicks: campaign.clicks });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sponsor/campaigns — Brand Partners create a new sponsored placement
+app.post('/api/sponsor/campaigns', sponsorRateLimit(20), authMiddleware, requireBrandPartner, async (req, res) => {
+  try {
+    const { name, imageUrl, description, ctaText, ctaUrl } = req.body;
+    if (!name || !ctaUrl) return res.status(400).json({ error: 'name and ctaUrl are required' });
+    const campaign = await SponsorCampaign.create({
+      brandEmail: req.user.email,
+      companyName: req.user.brandPartner.companyName || req.user.email,
+      name,
+      imageUrl: imageUrl || "",
+      description: description || "",
+      ctaText: ctaText || "Learn More",
+      ctaUrl
+    });
+    res.status(201).json(campaign);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sponsor/dashboard — Brand Partner analytics dashboard (own campaigns only)
+app.get('/api/sponsor/dashboard', sponsorRateLimit(30), authMiddleware, requireBrandPartner, async (req, res) => {
+  try {
+    const campaigns = await SponsorCampaign.find({ brandEmail: req.user.email }).sort({ createdAt: -1 });
+    const activeCampaigns = campaigns.filter(c => c.active).length;
+    const totalViews = campaigns.reduce((sum, c) => sum + (c.views || 0), 0);
+    const totalClicks = campaigns.reduce((sum, c) => sum + (c.clicks || 0), 0);
+    const ctr = totalViews > 0 ? (totalClicks / totalViews) * 100 : 0;
+    res.json({
+      totals: { activeCampaigns, totalViews, totalClicks, ctr: Number(ctr.toFixed(2)) },
+      campaigns: campaigns.map(c => ({
+        id: c._id,
+        name: c.name,
+        active: c.active,
+        views: c.views,
+        clicks: c.clicks,
+        ctr: c.views > 0 ? Number(((c.clicks / c.views) * 100).toFixed(2)) : 0
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ========== LEADERBOARD ==========
