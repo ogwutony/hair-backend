@@ -589,6 +589,25 @@ const shopifyWebhookEventSchema = new mongoose.Schema({
 });
 const ShopifyWebhookEvent = mongoose.model('ShopifyWebhookEvent', shopifyWebhookEventSchema);
 
+// Direct-message conversations between two users
+const conversationSchema = new mongoose.Schema({
+  participants:  [{ type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }],
+  lastMessage:   { type: String, default: '' },
+  lastMessageAt: { type: Date, default: Date.now },
+}, { timestamps: true });
+conversationSchema.index({ participants: 1 });
+const Conversation = mongoose.model('Conversation', conversationSchema);
+
+const messageSchema = new mongoose.Schema({
+  conversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true },
+  senderId:       { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  text:           { type: String, required: true },
+  readBy:         [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  createdAt:      { type: Date, default: Date.now }
+});
+messageSchema.index({ conversationId: 1, createdAt: -1 });
+const Message = mongoose.model('Message', messageSchema);
+
 // --- HELPERS ---
 const JWT_SECRET = process.env.JWT_SECRET || 'majority-hair-default-secret-change-me';
 
@@ -1684,6 +1703,73 @@ app.get('/api/partner/premium/status', requireBearerAuthorizationHeader, authMid
     rank_title: req.user.rank_title,
     message: 'You have Partner Premium access.'
   });
+});
+
+// ========== MESSAGING ==========
+
+// GET /api/messages/inbox - list conversation threads for the authenticated user
+app.get('/api/messages/inbox', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const conversations = await Conversation.find({ participants: userId })
+      .sort({ lastMessageAt: -1 })
+      .populate('participants', 'displayName email avatarUrl profilePictureUrl');
+
+    const threads = await Promise.all(conversations.map(async (conv) => {
+      const otherUser = conv.participants.find(p => String(p._id) !== String(userId));
+      const unreadCount = await Message.countDocuments({
+        conversationId: conv._id,
+        senderId: { $ne: userId },
+        readBy: { $ne: userId }
+      });
+
+      return {
+        id: conv._id,
+        otherUserId: otherUser ? otherUser._id : null,
+        otherUserName: otherUser ? (otherUser.displayName || otherUser.email) : '',
+        otherUserAvatar: otherUser ? (otherUser.avatarUrl || otherUser.profilePictureUrl || null) : null,
+        lastMessage: conv.lastMessage || '',
+        lastMessageAt: conv.lastMessageAt,
+        unreadCount
+      };
+    }));
+
+    res.json(threads);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== PUBLIC USER PROFILES ==========
+
+// GET /api/users/:id - public profile lookup by user id
+app.get('/api/users/:id', async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    res.json({
+      id: user._id,
+      email: user.email,
+      displayName: user.displayName || '',
+      avatarUrl: user.avatarUrl || user.profilePictureUrl || null,
+      rank: user.rank_title || getRankTitle(user.rank_score || 1),
+      followers: [],
+      following: [],
+      perspective: user.perspective || {
+        box1: { content: "", mediaUrls: [], videoUrl: null },
+        box2: { content: "", mediaUrls: [], videoUrl: null },
+        box3: { content: "", mediaUrls: [], videoUrl: null },
+        box4: { content: "", mediaUrls: [], videoUrl: null }
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ========== LEADERBOARD ==========

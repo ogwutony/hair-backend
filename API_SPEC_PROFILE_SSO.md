@@ -10,9 +10,11 @@
 1. [Overview](#overview)
 2. [Authentication (Social SSO)](#authentication-social-sso)
 3. [Profile Endpoints](#profile-endpoints)
-4. [Media Upload Endpoints](#media-upload-endpoints)
-5. [Data Models](#data-models)
-6. [Error Handling](#error-handling)
+4. [Messaging Endpoints](#messaging-endpoints)
+5. [Public User Profile Endpoint](#public-user-profile-endpoint)
+6. [Media Upload Endpoints](#media-upload-endpoints)
+7. [Data Models](#data-models)
+8. [Error Handling](#error-handling)
 
 ---
 
@@ -24,7 +26,7 @@ This API supports:
 - **Media Support**: Text, photos, videos with social media links
 - **Rank System**: Points-based progression with next-rank calculation
 
-**Base URL**: `https://hair-backend-2.onrender.com`
+**Base URL**: `https://hair-backend-1.onrender.com`
 
 ---
 
@@ -138,6 +140,7 @@ This API supports:
 
 ### 1. Get User Profile
 **Endpoint**: `GET /api/profile`
+**Status**: ✅ Implemented (includes `displayName` and `location`)
 
 **Headers**:
 ```
@@ -186,6 +189,8 @@ Authorization: Bearer {token}
     "tiktok": "tiktok_username",
     "facebook": "facebook_username"
   },
+  "displayName": "Jane Doe",
+  "location": "Los Angeles, CA",
   "createdAt": "2026-03-20T10:00:00Z",
   "updatedAt": "2026-03-20T15:30:00Z"
 }
@@ -202,6 +207,7 @@ Authorization: Bearer {token}
 
 ### 2. Update User Profile
 **Endpoint**: `PUT /api/profile`
+**Status**: ✅ Implemented (accepts and persists `displayName` and `location`)
 
 **Headers**:
 ```
@@ -233,7 +239,9 @@ Content-Type: application/json
       "mediaUrls": [],
       "videoUrl": null
     }
-  }
+  },
+  "displayName": "Jane Doe",
+  "location": "Los Angeles, CA"
 }
 ```
 
@@ -295,6 +303,75 @@ Content-Type: application/json
 ```json
 {
   "error": "Invalid social handle" | "Unauthorized"
+}
+```
+
+---
+
+## Messaging Endpoints
+
+### 1. Get Inbox
+**Status**: ✅ Implemented
+**Endpoint**: `GET /api/messages/inbox`
+
+**Headers**:
+```
+Authorization: Bearer {token}
+```
+
+**Response** (200):
+```json
+[
+  {
+    "id": "conversation-id",
+    "otherUserId": "other-user-id",
+    "otherUserName": "Jane Doe",
+    "otherUserAvatar": "https://...",
+    "lastMessage": "Hey, loved your last post!",
+    "lastMessageAt": "2026-03-20T15:30:00Z",
+    "unreadCount": 2
+  }
+]
+```
+
+**Error** (401):
+```json
+{
+  "error": "Unauthorized"
+}
+```
+
+---
+
+## Public User Profile Endpoint
+
+### 1. Get Public Profile
+**Status**: ✅ Implemented
+**Endpoint**: `GET /api/users/:id`
+
+**Response** (200):
+```json
+{
+  "id": "user-id",
+  "email": "user@example.com",
+  "displayName": "Jane Doe",
+  "avatarUrl": "https://...",
+  "rank": "bolshevik",
+  "followers": [],
+  "following": [],
+  "perspective": {
+    "box1": { "content": "...", "mediaUrls": [], "videoUrl": null },
+    "box2": { "content": "...", "mediaUrls": [], "videoUrl": null },
+    "box3": { "content": "...", "mediaUrls": [], "videoUrl": null },
+    "box4": { "content": "...", "mediaUrls": [], "videoUrl": null }
+  }
+}
+```
+
+**Error** (404):
+```json
+{
+  "error": "User not found"
 }
 ```
 
@@ -404,6 +481,8 @@ Content-Type: application/json
   passwordHash: String (nullable if SSO),
   rank_title: String,
   rank_score: Number (default: 1),
+  displayName: String (default: ""),
+  location: String (default: ""),
   
   // Profile perspective boxes
   perspective: {
@@ -444,6 +523,30 @@ Content-Type: application/json
   
   createdAt: Date,
   updatedAt: Date
+}
+```
+
+### Conversation Schema
+```javascript
+{
+  _id: ObjectId,
+  participants: [ObjectId],  // exactly 2 User refs
+  lastMessage: String,
+  lastMessageAt: Date,
+  createdAt: Date,
+  updatedAt: Date
+}
+```
+
+### Message Schema
+```javascript
+{
+  _id: ObjectId,
+  conversationId: ObjectId,
+  senderId: ObjectId,
+  text: String,
+  readBy: [ObjectId],  // User refs who have read this message
+  createdAt: Date
 }
 ```
 
@@ -525,7 +628,7 @@ const getPointsToNextRank = (currentScore, currentRank) => {
 REACT_APP_GOOGLE_CLIENT_ID=your-google-client-id
 REACT_APP_INSTAGRAM_APP_ID=your-instagram-app-id
 REACT_APP_TIKTOK_CLIENT_KEY=your-tiktok-client-key
-REACT_APP_BACKEND_URL=https://hair-backend-2.onrender.com
+REACT_APP_BACKEND_URL=https://hair-backend-1.onrender.com
 ```
 
 ### Next Rank Calculation (Frontend)
