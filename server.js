@@ -1774,6 +1774,98 @@ app.get('/api/messages/inbox', authMiddleware, async (req, res) => {
   }
 });
 
+// Resolve a message-thread target (email or user id) to a User document
+const resolveThreadUser = async (target) => {
+  const value = String(target || '').trim().toLowerCase();
+  if (!value) return null;
+  if (mongoose.isValidObjectId(value)) {
+    const byId = await User.findById(value);
+    if (byId) return byId;
+  }
+  return User.findOne({ email: value });
+};
+
+// GET /api/messages/thread?with=<email or userId> - message history with one other user
+app.get('/api/messages/thread', authMiddleware, async (req, res) => {
+  try {
+    const other = await resolveThreadUser(req.query.with);
+    if (!other) return res.status(404).json({ error: 'User not found' });
+
+    const conversation = await Conversation.findOne({
+      participants: { $all: [req.user._id, other._id], $size: 2 },
+    });
+    if (!conversation) return res.json([]);
+
+    const messages = await Message.find({ conversationId: conversation._id })
+      .sort({ createdAt: 1 })
+      .populate('senderId', 'email');
+
+    res.json(
+      messages.map((m) => ({
+        id: String(m._id),
+        fromUserEmail: m.senderId.email,
+        toUserEmail: String(m.senderId._id) === String(req.user._id) ? other.email : req.user.email,
+        text: m.text,
+        createdAt: m.createdAt,
+      })),
+    );
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/messages  { toUserId, text } - send a direct message, creating the conversation if needed
+app.post('/api/messages', authMiddleware, async (req, res) => {
+  try {
+    const trimmed = String(req.body?.text || '').trim();
+    if (!trimmed) return res.status(400).json({ error: 'text is required' });
+
+    const other = await resolveThreadUser(req.body?.toUserId);
+    if (!other) return res.status(404).json({ error: 'Recipient not found' });
+    if (String(other._id) === String(req.user._id)) {
+      return res.status(400).json({ error: 'Cannot message yourself' });
+    }
+
+    // App Store Guideline 1.2: a block must stop new messages in both directions
+    const viewerBlocked = (req.user.blockedEmails || []).map((e) => e.toLowerCase());
+    const otherBlocked = (other.blockedEmails || []).map((e) => e.toLowerCase());
+    if (viewerBlocked.includes(other.email.toLowerCase())) {
+      return res.status(403).json({ error: 'You have blocked this user' });
+    }
+    if (otherBlocked.includes(req.user.email.toLowerCase())) {
+      return res.status(403).json({ error: 'This user is not accepting messages from you' });
+    }
+
+    let conversation = await Conversation.findOne({
+      participants: { $all: [req.user._id, other._id], $size: 2 },
+    });
+    if (!conversation) {
+      conversation = await Conversation.create({ participants: [req.user._id, other._id] });
+    }
+
+    const message = await Message.create({
+      conversationId: conversation._id,
+      senderId: req.user._id,
+      text: trimmed,
+      readBy: [req.user._id],
+    });
+
+    conversation.lastMessage = trimmed;
+    conversation.lastMessageAt = message.createdAt;
+    await conversation.save();
+
+    res.status(201).json({
+      id: String(message._id),
+      fromUserEmail: req.user.email,
+      toUserEmail: other.email,
+      text: message.text,
+      createdAt: message.createdAt,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ========== PUBLIC USER PROFILES ==========
 
 // GET /api/users/:id - public profile lookup by user id
