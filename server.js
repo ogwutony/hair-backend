@@ -487,6 +487,12 @@ const userSchema = new mongoose.Schema({
     }
   },
 
+  // App Store safety features (Sign in with Apple, blocking, Terms of Use)
+  appleId: { type: String, index: true, sparse: true },
+  blockedEmails: { type: [String], default: [] },
+  termsAcceptedAt: { type: Date, default: null },
+  termsVersion: { type: String, default: null },
+
   // System / admin settings
   systemSettings: {
     adsEnabled: { type: Boolean, default: false }
@@ -548,6 +554,8 @@ const dumaSchema = new mongoose.Schema({
   submitterDisplayName: { type: String, default: "" },
   mediaUrls: { type: [String], default: [] },
   votes:      { yay: { type: Number, default: 0 }, nay: { type: Number, default: 0 } },
+  reportCount: { type: Number, default: 0 },
+  hiddenByModeration: { type: Boolean, default: false }, // set by moderation / reports
   createdAt:  { type: Date, default: Date.now }
 });
 
@@ -607,6 +615,24 @@ const messageSchema = new mongoose.Schema({
 });
 messageSchema.index({ conversationId: 1, createdAt: -1 });
 const Message = mongoose.model('Message', messageSchema);
+
+// User reports of objectionable content (App Store Guideline 1.2)
+const REPORT_CONTENT_TYPES = ['duma', 'marketplace', 'user', 'message'];
+const reportSchema = new mongoose.Schema({
+  reporterId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  reporterEmail: String,
+  contentType: { type: String, enum: REPORT_CONTENT_TYPES, required: true },
+  contentId: String,
+  reportedUser: String,
+  reason: { type: String, required: true },
+  details: String,
+  status: { type: String, enum: ['open', 'resolved'], default: 'open' },
+  action: String,
+  resolvedAt: Date,
+}, { timestamps: true });
+reportSchema.index({ status: 1, createdAt: -1 });
+reportSchema.index({ contentType: 1, contentId: 1 });
+const Report = mongoose.model('Report', reportSchema);
 
 // --- HELPERS ---
 const JWT_SECRET = process.env.JWT_SECRET || 'majority-hair-default-secret-change-me';
@@ -1056,7 +1082,7 @@ app.get('/api/duma', async (req, res) => {
 
     // Whitelist the type value to prevent NoSQL injection
     const query = (type && ALLOWED_DUMA_TYPES.has(type)) ? { type } : {};
-    const items = await DumaItem.find(query).sort({ createdAt: -1 });
+    const items = await DumaItem.find({ ...query, hiddenByModeration: { $ne: true } }).sort({ createdAt: -1 });
 
     // Enrich items with up-to-date submitter profile data
     const submitterEmails = [...new Set(items.map(i => i.submittedBy).filter(Boolean))];
@@ -1084,6 +1110,14 @@ app.get('/api/duma', async (req, res) => {
           location: item.location || profile.location || ""
       };
     });
+
+    // Hide content from users the viewer has blocked (App Store Guideline 1.2)
+    const viewerBlocked = await getViewerBlocked(req);
+    if (viewerBlocked.size) {
+      for (let i = enriched.length - 1; i >= 0; i--) {
+        if (viewerBlocked.has(String(enriched[i].submittedBy || '').toLowerCase())) enriched.splice(i, 1);
+      }
+    }
 
     // De-duplicate by submittedBy email — keep only the most recent item per user
     if (deduplicate === 'true') {
@@ -2029,6 +2063,354 @@ app.post('/api/profile/share', authMiddleware, async (req, res) => {
   const anySuccess = Object.values(results).some(r => r.success);
   res.status(anySuccess ? 200 : 422).json({ results });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// APP STORE REVIEW REQUIREMENTS
+//   • Sign in with Apple            (Guideline 4.8)
+//   • In-app account deletion       (Guideline 5.1.1(v))
+//   • Report / block / Terms (EULA) (Guideline 1.2 — user-generated content)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const APPLE_AUDIENCES = (process.env.APPLE_BUNDLE_IDS || 'com.themajorities.app')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+let appleKeysCache = { keys: [], fetchedAt: 0 };
+
+const getApplePublicKeyPem = async (kid) => {
+  const stale = Date.now() - appleKeysCache.fetchedAt > 6 * 3600 * 1000;
+  if (stale || !appleKeysCache.keys.some((k) => k.kid === kid)) {
+    const { data } = await axios.get('https://appleid.apple.com/auth/keys', { timeout: 10000 });
+    appleKeysCache = { keys: Array.isArray(data?.keys) ? data.keys : [], fetchedAt: Date.now() };
+  }
+  const jwk = appleKeysCache.keys.find((k) => k.kid === kid);
+  if (!jwk) throw new Error('Apple signing key not found');
+  return crypto.createPublicKey({ key: jwk, format: 'jwk' }).export({ type: 'spki', format: 'pem' });
+};
+
+const verifyAppleIdentityToken = async (identityToken) => {
+  const decoded = jwt.decode(identityToken, { complete: true });
+  if (!decoded?.header?.kid) throw new Error('Malformed Apple identity token');
+  const pem = await getApplePublicKeyPem(decoded.header.kid);
+  return jwt.verify(identityToken, pem, {
+    algorithms: ['RS256'],
+    issuer: 'https://appleid.apple.com',
+    audience: APPLE_AUDIENCES,
+  });
+};
+
+// POST /api/auth/apple/mobile — Sign in with Apple from the iOS app
+app.post('/api/auth/apple/mobile', async (req, res) => {
+  try {
+    const { identityToken, fullName } = req.body || {};
+    if (!identityToken) return res.status(400).json({ error: 'identityToken is required' });
+
+    let payload;
+    try {
+      payload = await verifyAppleIdentityToken(identityToken);
+    } catch (err) {
+      console.warn('Apple token verification failed:', err.message);
+      return res.status(401).json({ error: 'Apple sign in could not be verified. Please try again.' });
+    }
+
+    const appleId = payload.sub;
+    // Only trust the email inside Apple's signed token (may be a private relay address).
+    const tokenEmail = typeof payload.email === 'string' ? payload.email.toLowerCase().trim() : '';
+
+    let user = await User.findOne({ appleId });
+    if (!user && tokenEmail) {
+      user = await User.findOne({ email: tokenEmail });
+      if (user) {
+        user.appleId = appleId;
+        await user.save();
+      }
+    }
+    if (!user) {
+      const randomPassword = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 12);
+      const displayName = [fullName?.givenName, fullName?.familyName]
+        .filter((part) => typeof part === 'string' && part.trim())
+        .join(' ')
+        .trim();
+      user = await User.create({
+        email: tokenEmail || `apple_${appleId}@users.themajorities.com`,
+        password: randomPassword,
+        appleId,
+        displayName,
+        rank_title: 'bolshevik',
+        rank_score: 1,
+      });
+    }
+
+    const token = generateToken(user._id, true);
+    res.json({
+      email: user.email,
+      token,
+      rank_title: user.rank_title || getRankTitle(user.rank_score || 1),
+      rank_score: user.rank_score || 1,
+      _id: user._id,
+    });
+  } catch (err) {
+    console.error('Apple sign in error:', err);
+    res.status(500).json({ error: 'Apple sign in failed. Please try again.' });
+  }
+});
+
+// DELETE /api/account (and /api/user/account, used by the current app build)
+// Permanently deletes the signed-in user and their content.
+const deleteAccountHandler = async (req, res) => {
+  try {
+    const user = req.user;
+    const email = user.email;
+
+    await Promise.all([
+      DumaItem.deleteMany({ $or: [{ submittedBy: email }, { submitterId: user._id }] }),
+      Vote.deleteMany({ userId: user._id }),
+      Media.deleteMany({ userId: user._id }),
+      Message.deleteMany({ senderId: user._id }),
+      Conversation.deleteMany({ participants: user._id }),
+      Report.deleteMany({ reporterId: user._id }),
+      User.updateMany({ blockedEmails: email }, { $pull: { blockedEmails: email } }),
+    ]);
+    await User.deleteOne({ _id: user._id });
+
+    res.clearCookie('token', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'Strict' });
+    console.log(`🗑️ Account deleted: ${user._id}`);
+    res.json({ success: true, message: 'Your account and data have been deleted.' });
+  } catch (err) {
+    console.error('Account deletion error:', err);
+    res.status(500).json({ error: 'Account deletion failed. Please try again.' });
+  }
+};
+app.delete('/api/account', authMiddleware, deleteAccountHandler);
+app.delete('/api/user/account', authMiddleware, deleteAccountHandler);
+
+// Resolve a block/report target (email or user id) to a lower-case email when possible
+const resolveUserEmail = async (target) => {
+  const value = String(target || '').trim().toLowerCase();
+  if (!value) return '';
+  if (value.includes('@')) return value;
+  if (mongoose.isValidObjectId(value)) {
+    const found = await User.findById(value, 'email');
+    if (found?.email) return found.email.toLowerCase();
+  }
+  return value;
+};
+
+// Optional auth: returns the viewer's blocked list without rejecting guests
+const getViewerBlocked = async (req) => {
+  try {
+    let token = req.cookies?.token;
+    const authHeader = req.headers.authorization;
+    if (!token && authHeader?.startsWith('Bearer ')) token = authHeader.split(' ')[1];
+    if (!token) return new Set();
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const viewer = await User.findById(decoded.userId, 'blockedEmails');
+    return new Set((viewer?.blockedEmails || []).map((e) => String(e).toLowerCase()));
+  } catch {
+    return new Set();
+  }
+};
+
+// GET /api/users/blocked
+app.get('/api/users/blocked', authMiddleware, async (req, res) => {
+  res.json({ blocked: req.user.blockedEmails || [] });
+});
+
+// POST /api/users/block  { target: email | userId }
+app.post('/api/users/block', authMiddleware, async (req, res) => {
+  try {
+    const email = await resolveUserEmail(req.body?.target || req.body?.email || req.body?.userId);
+    if (!email) return res.status(400).json({ error: 'target is required' });
+    if (email === req.user.email.toLowerCase()) return res.status(400).json({ error: 'You cannot block yourself' });
+    await User.updateOne({ _id: req.user._id }, { $addToSet: { blockedEmails: email } });
+    res.json({ success: true, blocked: email });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not block user' });
+  }
+});
+
+// POST /api/users/unblock  { target: email | userId }
+app.post('/api/users/unblock', authMiddleware, async (req, res) => {
+  try {
+    const email = await resolveUserEmail(req.body?.target || req.body?.email || req.body?.userId);
+    if (!email) return res.status(400).json({ error: 'target is required' });
+    await User.updateOne({ _id: req.user._id }, { $pull: { blockedEmails: email } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not unblock user' });
+  }
+});
+
+const REPORT_AUTOHIDE_THRESHOLD = Number(process.env.REPORT_AUTOHIDE_THRESHOLD || 3);
+const MODERATION_EMAILS = (process.env.MODERATION_EMAILS || process.env.ADMIN_EMAILS || process.env.EMAIL_USER || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const escapeHtml = (value) =>
+  String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+
+// POST /api/report  { contentType, contentId, reportedUser, reason, details }
+app.post('/api/report', authMiddleware, async (req, res) => {
+  try {
+    const { contentType, contentId, reportedUser, reason, details } = req.body || {};
+    if (!REPORT_CONTENT_TYPES.includes(contentType)) return res.status(400).json({ error: 'Invalid contentType' });
+    if (!reason) return res.status(400).json({ error: 'reason is required' });
+
+    const report = await Report.create({
+      reporterId: req.user._id,
+      reporterEmail: req.user.email,
+      contentType,
+      contentId: String(contentId || '').slice(0, 200),
+      reportedUser: await resolveUserEmail(reportedUser),
+      reason: String(reason).slice(0, 200),
+      details: String(details || '').slice(0, 2000),
+    });
+
+    // Hide Duma posts automatically once several different people report them
+    if (contentType === 'duma' && mongoose.isValidObjectId(contentId)) {
+      const reporters = await Report.distinct('reporterId', { contentType: 'duma', contentId: String(contentId) });
+      await DumaItem.updateOne(
+        { _id: contentId },
+        {
+          $set: {
+            reportCount: reporters.length,
+            ...(reporters.length >= REPORT_AUTOHIDE_THRESHOLD ? { hiddenByModeration: true } : {}),
+          },
+        },
+      );
+    }
+
+    if (MODERATION_EMAILS.length) {
+      sendEmail(
+        MODERATION_EMAILS.join(','),
+        `[Moderation] New ${contentType} report: ${String(reason).slice(0, 60)}`,
+        `<p><strong>Reason:</strong> ${escapeHtml(reason)}</p>
+         <p><strong>Details:</strong> ${escapeHtml(details || '—')}</p>
+         <p><strong>Content:</strong> ${escapeHtml(contentType)} ${escapeHtml(contentId)}</p>
+         <p><strong>Reported user:</strong> ${escapeHtml(report.reportedUser || '—')}</p>
+         <p><strong>Reported by:</strong> ${escapeHtml(req.user.email)}</p>
+         <p>Please review within 24 hours. Hide a post with POST /api/admin/duma/:id/hide.</p>`,
+      ).catch((e) => console.error('Moderation email failed:', e.message));
+    }
+
+    res.status(201).json({ success: true, id: report._id });
+  } catch (err) {
+    console.error('Report error:', err);
+    res.status(500).json({ error: 'Could not submit report' });
+  }
+});
+
+// POST /api/duma/:id/report  { reason } — used by the current app build's Duma screen
+app.post('/api/duma/:id/report', authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reason = String(req.body?.reason || 'Unspecified').slice(0, 200);
+    if (!mongoose.isValidObjectId(id)) return res.status(400).json({ error: 'Invalid post id' });
+    const post = await DumaItem.findById(id, 'submittedBy');
+    if (!post) return res.status(404).json({ error: 'Post not found' });
+
+    const report = await Report.create({
+      reporterId: req.user._id,
+      reporterEmail: req.user.email,
+      contentType: 'duma',
+      contentId: id,
+      reportedUser: String(post.submittedBy || '').toLowerCase(),
+      reason,
+      details: String(req.body?.details || '').slice(0, 2000),
+    });
+
+    const reporters = await Report.distinct('reporterId', { contentType: 'duma', contentId: id });
+    await DumaItem.updateOne(
+      { _id: id },
+      {
+        $set: {
+          reportCount: reporters.length,
+          ...(reporters.length >= REPORT_AUTOHIDE_THRESHOLD ? { hiddenByModeration: true } : {}),
+        },
+      },
+    );
+
+    if (MODERATION_EMAILS.length) {
+      sendEmail(
+        MODERATION_EMAILS.join(','),
+        `[Moderation] New Duma report: ${reason.slice(0, 60)}`,
+        `<p><strong>Reason:</strong> ${escapeHtml(reason)}</p>
+         <p><strong>Post:</strong> ${escapeHtml(id)}</p>
+         <p><strong>Posted by:</strong> ${escapeHtml(report.reportedUser || '—')}</p>
+         <p><strong>Reported by:</strong> ${escapeHtml(req.user.email)}</p>
+         <p>Please review within 24 hours. Hide a post with POST /api/admin/duma/:id/hide.</p>`,
+      ).catch((e) => console.error('Moderation email failed:', e.message));
+    }
+
+    res.status(201).json({ success: true, id: report._id });
+  } catch (err) {
+    console.error('Duma report error:', err);
+    res.status(500).json({ error: 'Could not submit report' });
+  }
+});
+
+// POST /api/terms/accept  { version }
+app.post('/api/terms/accept', authMiddleware, async (req, res) => {
+  try {
+    await User.updateOne(
+      { _id: req.user._id },
+      { $set: { termsAcceptedAt: new Date(), termsVersion: String(req.body?.version || '').slice(0, 40) } },
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not save acceptance' });
+  }
+});
+
+// ── Moderation admin (set ADMIN_EMAILS="you@example.com" in the environment) ──
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const requireAdmin = (req, res, next) => {
+  if (!req.user || !ADMIN_EMAILS.includes(String(req.user.email).toLowerCase())) {
+    return res.status(403).json({ error: 'Admins only' });
+  }
+  next();
+};
+
+// GET /api/admin/reports?status=open
+app.get('/api/admin/reports', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const status = req.query.status === 'resolved' ? 'resolved' : 'open';
+    const reports = await Report.find({ status }).sort({ createdAt: -1 }).limit(200);
+    res.json(reports);
+  } catch (err) {
+    res.status(500).json({ error: 'Could not load reports' });
+  }
+});
+
+// POST /api/admin/reports/:id/resolve  { action }
+app.post('/api/admin/reports/:id/resolve', authMiddleware, requireAdmin, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: 'Invalid id' });
+  try {
+    await Report.updateOne(
+      { _id: req.params.id },
+      { $set: { status: 'resolved', resolvedAt: new Date(), action: String(req.body?.action || 'reviewed').slice(0, 100) } },
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not resolve report' });
+  }
+});
+
+// POST /api/admin/duma/:id/hide  |  /api/admin/duma/:id/unhide
+const setDumaHidden = (hidden) => async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: 'Invalid id' });
+  try {
+    await DumaItem.updateOne({ _id: req.params.id }, { $set: { hiddenByModeration: hidden } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not update post' });
+  }
+};
+app.post('/api/admin/duma/:id/hide', authMiddleware, requireAdmin, setDumaHidden(true));
+app.post('/api/admin/duma/:id/unhide', authMiddleware, requireAdmin, setDumaHidden(false));
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));
