@@ -287,54 +287,15 @@ if (MONGODB_URI) {
   console.error("❌ Error: MONGODB_URI is missing from environment variables.");
 }
 
-// --- RANK TIER SYSTEM (10-Million Scale) ---
-const RANK_TIERS = [
-  { title: "General Secretary",           min: 8500001, max: 10000000 },
-  { title: "Premier",                     min: 7000001, max: 8500000  },
-  { title: "Head of State",               min: 5500001, max: 7000000  },
-  { title: "Politburo",                   min: 4000001, max: 5500000  },
-  { title: "Party National",              min: 2500001, max: 4000000  },
-  { title: "Central committee",           min: 1000001, max: 2500000  },
-  { title: "Councils of ministers",       min: 500001,  max: 1000000  },
-  { title: "Supreme soviets",             min: 250000,  max: 500000   },
-  { title: "Republican Party committeemen", min: 160000, max: 249999  },
-  { title: "Regional party head",         min: 80000,   max: 159999   },
-  { title: "City Party Head",             min: 40000,   max: 79999    },
-  { title: "District Party head",         min: 20000,   max: 39999    },
-  { title: "District Soviet",             min: 10000,   max: 19999    },
-  { title: "Executive",                   min: 5000,    max: 9999     },
-  { title: "Department head",             min: 2500,    max: 4999     },
-  { title: "enterprises",                 min: 2000,    max: 2499     },
-  { title: "Executive",                   min: 1500,    max: 1999     },
-  { title: "Department head",             min: 1250,    max: 1499     },
-  { title: "enterprises",                 min: 1000,    max: 1249     },
-  { title: "Partymember",                 min: 800,     max: 999      },
-  { title: "bold carp",                   min: 500,     max: 799      },
-  { title: "crucian carp",                min: 250,     max: 499      },
-  { title: "elephants",                   min: 160,     max: 249      },
-  { title: "Small elephants",             min: 80,      max: 159      },
-  { title: "godok",                       min: 40,      max: 79       },
-  { title: "podgodok",                    min: 20,      max: 39       },
-  { title: "one-and-a-half",              min: 10,      max: 19       },
-  { title: "bolshevik",                   min: 1,       max: 9        },
-];
-
-const POLITBURO_MIN = 4000001; // Politburo rank minimum score
-
-const getRankTitle = (score) => {
-  for (const tier of RANK_TIERS) {
-    if (score >= tier.min) return tier.title;
-  }
-  return "bolshevik";
-};
-
-const getRankRange = (title) => {
-  const tier = RANK_TIERS.find(t => t.title === title);
-  if (!tier) return "1 - 9";
-  return `${tier.min.toLocaleString()} - ${tier.max.toLocaleString()}`;
-};
-
-const isPolitburoOrHigher = (score) => score >= POLITBURO_MIN;
+// --- RANK TIER SYSTEM (75-Million Scale) ---
+// Shared ladder lives in lib/rankTiers.js (mirrors hair-frontend/src/utils/constants.js).
+const {
+  RANK_TIERS,
+  MAX_RANK_SCORE,
+  getRankTitle,
+  getRankRange,
+  isPolitburoOrHigher,
+} = require('./lib/rankTiers');
 
 // Premium Partner threshold — users must reach 10,000,000 points to access partner features
 const PARTNER_PREMIUM_MIN = 10000000;
@@ -426,7 +387,7 @@ const userSchema = new mongoose.Schema({
   resetToken:       { type: String },
   resetTokenExpiry: { type: Date },
   rank_score:       { type: Number, default: 1 },   // BigInt-scale (up to 10,000,000)
-  rank_title:       { type: String, default: 'bolshevik' },
+  rank_title:       { type: String, default: 'Comrade' },
   rank_rewards_sent: { type: [String], default: [] }, // Track which ranks already rewarded
   avatarUrl: { type: String, default: null }, // Profile avatar image URL
   profilePictureUrl: { type: String, default: null }, // Profile picture URL (canonical)
@@ -720,7 +681,7 @@ const sendRankUpEmail = async (user, newRankTitle) => {
       <p>As a reward for your contribution to the total solution, please enjoy <strong>25% OFF</strong> your next one-time order.</p>
       <p style="font-size: 18px;"><strong>Your Unique Reward Code: <span style="color: #c00;">MAJORITY25</span></strong></p>
       <a href="${shopUrl}" style="display:inline-block; background:#222; color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold; margin-top:10px;">Redeem My 25% Discount</a>
-      <p style="margin-top:30px; color:#666;">Keep climbing — the path to <strong>General Secretary</strong> is waiting for you.</p>
+      <p style="margin-top:30px; color:#666;">Keep climbing — the path to <strong>Nice and Helpful</strong> is waiting for you.</p>
     </div>
   `;
 
@@ -737,8 +698,9 @@ const updateRankScore = async (userId, pointsToAdd) => {
   const user = await User.findById(userId);
   if (!user) return;
 
-  const oldTitle = user.rank_title;
-  const newScore = Math.min((user.rank_score || 1) + pointsToAdd, 10000000);
+  // Compare score-derived titles so legacy stored titles don't trigger false rank-up emails
+  const oldTitle = getRankTitle(user.rank_score || 1);
+  const newScore = Math.min((user.rank_score || 1) + pointsToAdd, MAX_RANK_SCORE);
   const newTitle = getRankTitle(newScore);
 
   await User.findByIdAndUpdate(userId, {
@@ -867,7 +829,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   res.json({
     email: user.email,
     rank_score: user.rank_score,
-    rank_title: user.rank_title || getRankTitle(user.rank_score || 1),
+    rank_title: getRankTitle(user.rank_score || 1),
     isPolitburoOrHigher: isPolitburoOrHigher(user.rank_score || 1)
   });
 });
@@ -900,7 +862,7 @@ app.post('/api/auth/google', async (req, res) => {
         email,
         password: randomPassword,
         googleId: googleResponse.data.id,
-        rank_title: 'bolshevik',
+        rank_title: 'Comrade',
         rank_score: 1
       });
     } else {
@@ -925,7 +887,7 @@ app.post('/api/auth/google', async (req, res) => {
     res.json({
       email: user.email,
       token,
-      rank_title: user.rank_title || getRankTitle(user.rank_score || 1),
+      rank_title: getRankTitle(user.rank_score || 1),
       rank_score: user.rank_score || 1,
       _id: user._id
     });
@@ -949,7 +911,7 @@ app.post('/api/signup', async (req, res) => {
       email: email.toLowerCase(),
       password: hashed,
       rank_score: 1,
-      rank_title: 'bolshevik'
+      rank_title: 'Comrade'
     });
     const token = generateToken(user._id, false);
 
@@ -961,7 +923,7 @@ app.post('/api/signup', async (req, res) => {
     };
     res.cookie('token', token, cookieOptions);
 
-    res.status(201).json({ message: 'Account created', token, email: user.email, rank_title: user.rank_title });
+    res.status(201).json({ message: 'Account created', token, email: user.email, rank_title: getRankTitle(user.rank_score || 1) });
   } catch (err) {
     res.status(500).json({ error: 'Signup failed' });
   }
@@ -990,7 +952,7 @@ app.post('/api/login', async (req, res) => {
       success: true,
       token,
       email: user.email,
-      rank_title: user.rank_title || getRankTitle(user.rank_score || 1),
+      rank_title: getRankTitle(user.rank_score || 1),
       rank_score: user.rank_score || 1
     });
   } catch (err) {
@@ -1088,7 +1050,7 @@ app.get('/api/duma', async (req, res) => {
     const submitterEmails = [...new Set(items.map(i => i.submittedBy).filter(Boolean))];
     const submitters = await User.find(
       { email: { $in: submitterEmails } },
-            'email profilePictureUrl avatarUrl socialLinks displayName location'
+            'email profilePictureUrl avatarUrl socialLinks displayName location rank_score'
     );
     const submitterMap = {};
     for (const u of submitters) {
@@ -1096,7 +1058,8 @@ app.get('/api/duma', async (req, res) => {
         profilePictureUrl: resolveProfilePictureUrl(u),
         socialLinks: u.socialLinks || DEFAULT_SOCIAL_LINKS,
           displayName: u.displayName || "",
-          location: u.location || ""
+          location: u.location || "",
+          rankScore: u.rank_score || 1
       };
     }
 
@@ -1107,7 +1070,12 @@ app.get('/api/duma', async (req, res) => {
         submitterProfilePictureUrl: profile.profilePictureUrl || item.submitterProfilePictureUrl || null,
         submitterSocialLinks: profile.socialLinks || item.submitterSocialLinks || DEFAULT_SOCIAL_LINKS,
           submitterDisplayName: profile.displayName || item.submitterDisplayName || "",
-          location: item.location || profile.location || ""
+          location: item.location || profile.location || "",
+          // Rank is always recomputed from the submitter's current score (single ladder in lib/rankTiers.js)
+          rankScore: profile.rankScore || null,
+          submitterRank: profile.rankScore
+            ? getRankTitle(profile.rankScore)
+            : (RANK_TIERS.some(t => t.title === item.submitterRank) ? item.submitterRank : getRankTitle(1))
       };
     });
 
@@ -1186,7 +1154,7 @@ app.post('/api/duma/recommend', requireBearerAuthorizationHeader, authMiddleware
       return res.status(400).json({ error: 'All fields required: name, brand, webLink, reason' });
     }
 
-    const rankTitle = req.user.rank_title || getRankTitle(req.user.rank_score || 1);
+    const rankTitle = getRankTitle(req.user.rank_score || 1);
     const item = await DumaItem.create({
       type: 'Product Recommendation',
       name,
@@ -1222,7 +1190,7 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
     }
 
     const rankScore = req.user.rank_score || 1;
-    const rankTitle = req.user.rank_title || getRankTitle(rankScore);
+    const rankTitle = getRankTitle(rankScore);
 
     if (tier === 'Premium' && rankScore < PARTNER_PREMIUM_MIN) {
       return res.status(403).json({
@@ -1258,7 +1226,7 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
 app.post('/api/duma/culture', authMiddleware, async (req, res) => {
   try {
     const { prompt, response, videoUrl, perspective, category, submitterAvatar, location, mediaUrls } = req.body;
-    const rankTitle = req.user.rank_title || getRankTitle(req.user.rank_score || 1);
+    const rankTitle = getRankTitle(req.user.rank_score || 1);
     const isVideoSubmission = Boolean(videoUrl);
 
     const item = await DumaItem.create({
@@ -1320,7 +1288,7 @@ app.get('/api/rank', authMiddleware, async (req, res) => {
   const user = req.user;
   res.json({
     rank_score: user.rank_score || 1,
-    rank_title: user.rank_title || getRankTitle(user.rank_score || 1),
+    rank_title: getRankTitle(user.rank_score || 1),
     isPolitburoOrHigher: isPolitburoOrHigher(user.rank_score || 1)
   });
 });
@@ -1333,7 +1301,7 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
     const user = req.user;
     res.json({
       email: user.email,
-      rank_title: user.rank_title || getRankTitle(user.rank_score || 1),
+      rank_title: getRankTitle(user.rank_score || 1),
       rank_score: user.rank_score || 1,
       perspective: user.perspective || {
         box1: { content: "", mediaUrls: [], videoUrl: null },
@@ -1536,7 +1504,7 @@ app.post('/api/profile/add-points', authMiddleware, async (req, res) => {
 
     await updateRankScore(req.user._id, points);
     const user = await User.findById(req.user._id);
-    res.json({ success: true, rank_score: user.rank_score, rank_title: user.rank_title });
+    res.json({ success: true, rank_score: user.rank_score, rank_title: getRankTitle(user.rank_score || 1) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1734,7 +1702,7 @@ app.get('/api/partner/premium/status', requireBearerAuthorizationHeader, authMid
   res.json({
     access: true,
     rank_score: req.user.rank_score,
-    rank_title: req.user.rank_title,
+    rank_title: getRankTitle(req.user.rank_score || 1),
     message: 'You have Partner Premium access.'
   });
 });
@@ -1883,7 +1851,7 @@ app.get('/api/users/:id', async (req, res) => {
       email: user.email,
       displayName: user.displayName || '',
       avatarUrl: user.avatarUrl || user.profilePictureUrl || null,
-      rank: user.rank_title || getRankTitle(user.rank_score || 1),
+      rank: getRankTitle(user.rank_score || 1),
       followers: [],
       following: [],
       perspective: user.perspective || {
@@ -1903,8 +1871,9 @@ app.get('/api/leaderboard', async (req, res) => {
   try {
     const users = await User.find({}, 'email rank_score rank_title')
       .sort({ rank_score: -1 })
-      .limit(50);
-    res.json(users);
+      .limit(50)
+      .lean();
+    res.json(users.map(u => ({ ...u, rank_title: getRankTitle(u.rank_score || 1) })));
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch leaderboard' });
   }
@@ -2228,7 +2197,7 @@ app.post('/api/auth/apple/mobile', async (req, res) => {
         password: randomPassword,
         appleId,
         displayName,
-        rank_title: 'bolshevik',
+        rank_title: 'Comrade',
         rank_score: 1,
       });
     }
@@ -2237,7 +2206,7 @@ app.post('/api/auth/apple/mobile', async (req, res) => {
     res.json({
       email: user.email,
       token,
-      rank_title: user.rank_title || getRankTitle(user.rank_score || 1),
+      rank_title: getRankTitle(user.rank_score || 1),
       rank_score: user.rank_score || 1,
       _id: user._id,
     });
