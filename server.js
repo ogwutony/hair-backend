@@ -645,24 +645,105 @@ const requireBearerAuthorizationHeader = (req, res, next) => {
   next();
 };
 
-const sendEmail = async (to, subject, html) => {
+// Convert simple HTML into a readable plain-text alternative.
+// HTML-only mail is a common spam signal, so every message gets a text part.
+const htmlToText = (html = '') => String(html)
+  .replace(/<(style|script)[^>]*>[\s\S]*?<\/\1>/gi, '')
+  .replace(/<a\s[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (m, href, label) => {
+    const text = label.replace(/<[^>]+>/g, '').trim();
+    return text && text !== href ? `${text}: ${href}` : href;
+  })
+  .replace(/<br\s*\/?>/gi, '\n')
+  .replace(/<\/(p|div|h[1-6]|li|tr|table)>/gi, '\n')
+  .replace(/<li[^>]*>/gi, '- ')
+  .replace(/<[^>]+>/g, '')
+  .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+  .replace(/[ \t]+\n/g, '\n')
+  .replace(/\n{3,}/g, '\n\n')
+  .trim();
+
+// Reuse one SMTP connection instead of creating a new transporter per email.
+let mailTransporter = null;
+const getMailTransporter = () => {
+  if (!mailTransporter) {
+    mailTransporter = nodemailer.createTransport({
+      service: 'gmail',
+      pool: true,
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+      }
+    });
+  }
+  return mailTransporter;
+};
+
+// EMAIL_FROM (optional): address mail is sent from, e.g. support@themajorities.com.
+// It must be EMAIL_USER itself or a verified "Send mail as" alias of it in Gmail,
+// and should be on a domain with SPF, DKIM and DMARC configured.
+// EMAIL_REPLY_TO (optional): where customer replies go.
+const sendEmail = async (to, subject, html, text) => {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
     console.error("❌ Email credentials missing.");
     return;
   }
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS
-    }
-  });
-  await transporter.sendMail({
-    from: `"Majority Hair Solutions" <${process.env.EMAIL_USER}>`,
+  const fromAddress = process.env.EMAIL_FROM || process.env.EMAIL_USER;
+  const message = {
+    from: `"Majority Hair Solutions" <${fromAddress}>`,
     to,
     subject,
-    html
-  });
+    html,
+    text: text || htmlToText(html)
+  };
+  if (process.env.EMAIL_REPLY_TO) message.replyTo = process.env.EMAIL_REPLY_TO;
+  await getMailTransporter().sendMail(message);
+};
+
+const escapeResetHtml = (str = '') => String(str)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+const buildPasswordResetEmail = (name, resetUrl) => {
+  const firstName = (name || '').trim().split(/\s+/)[0];
+  const greeting = firstName ? `Hi ${firstName},` : 'Hi,';
+  const subject = 'Reset your Majority Hair Solutions password';
+  const text = [
+    greeting,
+    '',
+    'We received a request to reset the password for your Majority Hair Solutions (The Majorities) account.',
+    '',
+    'To choose a new password, open this link:',
+    resetUrl,
+    '',
+    'This link expires in 1 hour. If you did not request a password reset, you can ignore this email and your password will stay the same.',
+    '',
+    'Majority Hair Solutions (The Majorities)',
+    'Fort Worth, Texas',
+    'https://themajorities.com'
+  ].join('\n');
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${subject}</title></head>
+<body style="margin:0;padding:0;background:#f6f6f6;font-family:Arial,Helvetica,sans-serif;color:#222;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f6f6f6;padding:24px 0;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#ffffff;border-radius:8px;padding:32px;">
+        <tr><td>
+          <h1 style="font-size:20px;margin:0 0 16px;">Reset your password</h1>
+          <p style="font-size:15px;line-height:1.5;margin:0 0 16px;">${escapeResetHtml(greeting)}</p>
+          <p style="font-size:15px;line-height:1.5;margin:0 0 24px;">We received a request to reset the password for your Majority Hair Solutions (The Majorities) account. Click the button below to choose a new password.</p>
+          <p style="margin:0 0 24px;"><a href="${resetUrl}" style="display:inline-block;background:#111111;color:#ffffff;text-decoration:none;padding:12px 24px;border-radius:6px;font-size:15px;">Reset password</a></p>
+          <p style="font-size:13px;line-height:1.5;color:#555;margin:0 0 8px;">Or copy and paste this link into your browser:</p>
+          <p style="font-size:13px;line-height:1.5;word-break:break-all;margin:0 0 24px;"><a href="${resetUrl}" style="color:#555;">${resetUrl}</a></p>
+          <p style="font-size:13px;line-height:1.5;color:#555;margin:0;">This link expires in 1 hour. If you did not request a password reset, you can ignore this email and your password will stay the same.</p>
+        </td></tr>
+      </table>
+      <p style="font-size:12px;color:#888;margin:16px 0 0;">Majority Hair Solutions (The Majorities) &middot; Fort Worth, Texas &middot; <a href="https://themajorities.com" style="color:#888;">themajorities.com</a></p>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+  return { subject, html, text };
 };
 
 // Send rank-up reward email (once per rank)
@@ -984,9 +1065,11 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const frontendUrl = process.env.FRONTEND_URL || 'https://themajorities.com';
     const resetUrl = `${frontendUrl}/reset-password/${rawToken}`;
 
-    await sendEmail(user.email, 'Reset Your Password', `<p>Click <a href="${resetUrl}">here</a> to reset your password.</p>`);
+    const resetEmail = buildPasswordResetEmail(user.name, resetUrl);
+    await sendEmail(user.email, resetEmail.subject, resetEmail.html, resetEmail.text);
     res.json({ message: SAFE_MSG });
   } catch (err) {
+    console.error('❌ Forgot-password email failed:', err);
     res.status(500).json({ error: 'Email failed' });
   }
 });
