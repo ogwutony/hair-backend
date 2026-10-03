@@ -296,6 +296,7 @@ const {
   getRankRange,
   isPolitburoOrHigher,
 } = require('./lib/rankTiers');
+const { findNearestPlace, parseCoordinate, isPlacesConfigured } = require('./lib/places');
 
 // Premium Partner threshold — users must reach 10,000,000 points to access partner features
 const PARTNER_PREMIUM_MIN = 10000000;
@@ -1374,6 +1375,28 @@ app.get('/api/rank', authMiddleware, async (req, res) => {
     rank_title: getRankTitle(user.rank_score || 1),
     isPolitburoOrHigher: isPolitburoOrHigher(user.rank_score || 1)
   });
+});
+
+// ========== PLACES ==========
+
+// GET /api/places/nearby?lat=..&lng=.. - Nearest named place for location tagging (mobile auto-location).
+// Logged-in only, so the Google Places key can't be used by anyone off the street.
+app.get('/api/places/nearby', authMiddleware, async (req, res) => {
+  const lat = parseCoordinate(req.query.lat, 90);
+  const lng = parseCoordinate(req.query.lng, 180);
+  if (lat === null || lng === null) {
+    return res.status(400).json({ error: 'Valid lat and lng are required' });
+  }
+  if (!isPlacesConfigured()) {
+    return res.status(503).json({ error: 'Place lookup is not configured' });
+  }
+  try {
+    const place = await findNearestPlace(lat, lng);
+    res.json({ place });
+  } catch (err) {
+    console.error('Places nearby lookup failed:', err.response?.data?.error?.message || err.message);
+    res.status(502).json({ error: 'Place lookup failed' });
+  }
 });
 
 // ========== PROFILE ENDPOINTS ==========
