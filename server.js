@@ -310,10 +310,10 @@ const {
 const { findNearestPlace, parseCoordinate, isPlacesConfigured } = require('./lib/places');
 const { validatePartnerApplication, publicPartnerSummary, toPublicDumaItem } = require('./lib/partners');
 
-// Premium Partner threshold — users must reach 10,000,000 points to access partner features
-const PARTNER_PREMIUM_MIN = 10000000;
+// Premium Partner threshold — 900,000 points ("Supreme Lizard King"), matching the web and mobile apps
+const PARTNER_PREMIUM_MIN = 900000;
 
-// Middleware: requires the authenticated user to hold Partner Premium rank (≥ 10,000,000 points)
+// Middleware: requires the authenticated user to hold Partner Premium rank (≥ PARTNER_PREMIUM_MIN points)
 const requirePartnerPremium = async (req, res, next) => {
   // Depends on authMiddleware having run first to populate req.user
   if (!req.user) {
@@ -322,7 +322,7 @@ const requirePartnerPremium = async (req, res, next) => {
   const score = req.user.rank_score || 0;
   if (score < PARTNER_PREMIUM_MIN) {
     return res.status(403).json({
-      error: 'Access denied. Partner Premium features require 10,000,000 points.',
+      error: `Access denied. Partner Premium features require ${PARTNER_PREMIUM_MIN.toLocaleString('en-US')} points.`,
       current_score: score,
       required_score: PARTNER_PREMIUM_MIN
     });
@@ -1276,7 +1276,7 @@ app.post('/api/duma/recommend', requireBearerAuthorizationHeader, authMiddleware
 
 // 4. Submit partner application to Duma
 // Standard applications are available to all authenticated users.
-// Premium tier requires the requirePartnerPremium middleware (≥ 10,000,000 points).
+// Premium tier requires the requirePartnerPremium middleware (≥ PARTNER_PREMIUM_MIN points).
 // The web and mobile forms send multipart/form-data (fields + photos/videos); see lib/partners.js.
 const parsePartnerUpload = (req, res, next) => {
   partnerUpload.any()(req, res, (err) => {
@@ -1299,9 +1299,9 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
     const rankScore = req.user.rank_score || 1;
     const rankTitle = getRankTitle(rankScore);
 
-    if (application.tier === 'Premium' && rankScore < PARTNER_PREMIUM_MIN) {
+    if ((application.tier === 'Premium' || application.tier === 'Premium Partner') && rankScore < PARTNER_PREMIUM_MIN) {
       return res.status(403).json({
-        error: 'Premium Partner status requires 10,000,000 points.',
+        error: `Premium Partner status requires ${PARTNER_PREMIUM_MIN.toLocaleString('en-US')} points.`,
         current_score: rankScore,
         required_score: PARTNER_PREMIUM_MIN
       });
@@ -1858,7 +1858,7 @@ app.delete('/api/media/:mediaId', authMiddleware, async (req, res) => {
 });
 
 // ========== PREMIUM PARTNER ENDPOINTS ==========
-// All routes below require authentication AND ≥ 10,000,000 rank points.
+// All routes below require authentication AND ≥ PARTNER_PREMIUM_MIN rank points.
 
 // GET /api/partner/premium/status — check whether the authenticated user has Partner Premium access
 app.get('/api/partner/premium/status', requireBearerAuthorizationHeader, authMiddleware, requirePartnerPremium, (req, res) => {
