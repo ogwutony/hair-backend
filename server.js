@@ -263,6 +263,17 @@ const upload = multer({
   }
 });
 
+// Partner applications: any image/video (the mobile app labels files by extension, e.g. image/jpg,
+// image/heic — Cloudinary handles the format), 50MB each, at most 16 files
+const partnerUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 52428800, files: 16 },
+  fileFilter: (req, file, cb) => {
+    if (/^(image|video)\//.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Only photos and videos can be attached'));
+  }
+});
+
 // Avatar-specific upload: JPG/PNG only, 5MB max
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
@@ -297,6 +308,7 @@ const {
   isPolitburoOrHigher,
 } = require('./lib/rankTiers');
 const { findNearestPlace, parseCoordinate, isPlacesConfigured } = require('./lib/places');
+const { validatePartnerApplication, publicPartnerSummary, toPublicDumaItem } = require('./lib/partners');
 
 // Premium Partner threshold — users must reach 10,000,000 points to access partner features
 const PARTNER_PREMIUM_MIN = 10000000;
@@ -498,6 +510,8 @@ const dumaSchema = new mongoose.Schema({
   ein:        String,   // Partner: Employer Identification Number
   inventory:  { type: mongoose.Schema.Types.Mixed }, // Partner: structured inventory parameters
   contractConfirmed: { type: Boolean, default: false }, // Partner: digital contract confirmation
+  partnerCategory: String, // Partner: category shown publicly (e.g. "Review Request")
+  partner: { type: mongoose.Schema.Types.Mixed }, // Partner: full private application (contact, EIN, details) — never sent to the public feed
   prompt:     String,
   response:   String,
   videoUrl:   String, // Culture video URL
@@ -1150,7 +1164,7 @@ app.get('/api/duma', async (req, res) => {
     const enriched = items.map(item => {
       const profile = submitterMap[item.submittedBy] || {};
       return {
-        ...item.toObject(),
+        ...toPublicDumaItem(item.toObject()), // never expose partner EINs / contact details
         submitterProfilePictureUrl: profile.profilePictureUrl || item.submitterProfilePictureUrl || null,
         submitterSocialLinks: profile.socialLinks || item.submitterSocialLinks || DEFAULT_SOCIAL_LINKS,
           submitterDisplayName: profile.displayName || item.submitterDisplayName || "",
@@ -1263,20 +1277,29 @@ app.post('/api/duma/recommend', requireBearerAuthorizationHeader, authMiddleware
 // 4. Submit partner application to Duma
 // Standard applications are available to all authenticated users.
 // Premium tier requires the requirePartnerPremium middleware (≥ 10,000,000 points).
-app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, async (req, res) => {
-  try {
-    const { company, ein, product, desc, inventory, contractConfirmed, tier } = req.body;
-    if (!company || !ein || !product || !desc) {
-      return res.status(400).json({ error: 'All fields required: company, ein, product, desc' });
+// The web and mobile forms send multipart/form-data (fields + photos/videos); see lib/partners.js.
+const parsePartnerUpload = (req, res, next) => {
+  partnerUpload.any()(req, res, (err) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ error: 'Each photo or video must be 50MB or smaller.' });
     }
-    if (contractConfirmed !== true) {
-      return res.status(400).json({ error: 'Digital contract confirmation is required' });
+    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({ error: 'Too many files attached.' });
     }
+    return res.status(400).json({ error: err.message || 'Invalid upload' });
+  });
+};
 
+app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, parsePartnerUpload, async (req, res) => {
+  const { error, application } = validatePartnerApplication(req.body || {});
+  if (error) return res.status(400).json({ error });
+
+  try {
     const rankScore = req.user.rank_score || 1;
     const rankTitle = getRankTitle(rankScore);
 
-    if (tier === 'Premium' && rankScore < PARTNER_PREMIUM_MIN) {
+    if (application.tier === 'Premium' && rankScore < PARTNER_PREMIUM_MIN) {
       return res.status(403).json({
         error: 'Premium Partner status requires 10,000,000 points.',
         current_score: rankScore,
@@ -1284,13 +1307,25 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
       });
     }
 
+    // Photos/videos go to Cloudinary; keep each URL with the form field it came from
+    let media = [];
+    try {
+      media = await Promise.all((req.files || []).map(async (file) => {
+        const result = await uploadToCloudinary(file.buffer);
+        return { field: file.fieldname, url: result.secure_url, type: file.mimetype.startsWith('video') ? 'video' : 'image' };
+      }));
+    } catch (uploadErr) {
+      console.error('Partner media upload failed:', uploadErr.message);
+      return res.status(502).json({ error: 'Could not upload your photos or video. Please try again.' });
+    }
+
     const item = await DumaItem.create({
       type: 'Partner',
-      company,
-      ein,
-      product,
-      desc,
-      inventory: inventory || null,
+      partnerCategory: application.category,
+      company: application.company,
+      desc: publicPartnerSummary(application),
+      mediaUrls: media.map((m) => m.url),
+      partner: { ...application, media },
       contractConfirmed: true,
       submittedBy: req.user.email,
       submitterRank: rankTitle,
@@ -1300,8 +1335,30 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
     });
 
     await updateRankScore(req.user._id, 10);
-    res.status(201).json({ message: "Your partner application has been submitted to The Majority's Duma", item });
+
+    if (MODERATION_EMAILS.length) {
+      const rows = [
+        ['Category', application.category], ['Company / name', application.company],
+        ['Contact', `${application.name} · ${application.contactEmail} · ${application.phoneNumber}`],
+        ['EIN', application.ein || '—'], ['Country', `${application.countryOfOrigin} → ${application.operatingCountry}`],
+        ['Website / social', application.websiteOrSocial || '—'], ['Tier', application.tier],
+        ...Object.entries(application.details).filter(([, v]) => v).map(([k, v]) => [k, v]),
+        ['Media', media.map((m) => m.url).join('\n') || '—'], ['Submitted by', req.user.email],
+      ];
+      sendEmail(
+        MODERATION_EMAILS.join(','),
+        `[Partner] New ${application.category}: ${application.company.slice(0, 60)}`,
+        rows.map(([k, v]) => `<p><strong>${escapeHtml(k)}:</strong> ${escapeHtml(v).replace(/\n/g, '<br>')}</p>`).join('')
+          + `<p>Full applications: GET /api/admin/partner-applications</p>`,
+      ).catch((e) => console.error('Partner application email failed:', e.message));
+    }
+
+    res.status(201).json({
+      message: "Your partner application has been submitted to The Majority's Duma",
+      item: toPublicDumaItem(item.toObject()),
+    });
   } catch (err) {
+    console.error('Partner application error:', err.message);
     res.status(500).json({ error: 'Failed to submit partner application' });
   }
 });
@@ -2549,6 +2606,21 @@ app.get('/api/admin/reports', authMiddleware, requireAdmin, async (req, res) => 
     res.json(reports);
   } catch (err) {
     res.status(500).json({ error: 'Could not load reports' });
+  }
+});
+
+// GET /api/admin/partner-applications?category=Review%20Request — full private applications
+app.get('/api/admin/partner-applications', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const query = { type: 'Partner' };
+    if (typeof req.query.category === 'string' && req.query.category) query.partnerCategory = req.query.category;
+    const items = await DumaItem.find(query).sort({ createdAt: -1 }).limit(200);
+    res.json(items.map((i) => ({
+      id: i._id, createdAt: i.createdAt, submittedBy: i.submittedBy,
+      company: i.company, partnerCategory: i.partnerCategory, application: i.partner || null, mediaUrls: i.mediaUrls,
+    })));
+  } catch (err) {
+    res.status(500).json({ error: 'Could not load partner applications' });
   }
 });
 
