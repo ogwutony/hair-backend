@@ -930,46 +930,88 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   });
 });
 
-// POST /api/auth/google - Google OAuth Authentication
+// POST /api/auth/google - Google OAuth Authentication (sign up OR log in)
+// Accepts either { accessToken } (token flow, used by the website) or
+// { code, redirectUri } (code flow; needs GOOGLE_CLIENT_SECRET on the server).
+// Creates the account on first sign-in, so Gmail users can sign up with one click.
+// Set GOOGLE_CLIENT_ID on the server (comma-separate if there are several web client IDs).
+const GOOGLE_WEB_CLIENT_IDS = (process.env.GOOGLE_CLIENT_ID || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+if (GOOGLE_WEB_CLIENT_IDS.length === 0) {
+  console.warn('WARNING: GOOGLE_CLIENT_ID is not set — Google sign-in will be rejected until it is added.');
+}
+
 app.post('/api/auth/google', async (req, res) => {
   try {
-    const { accessToken } = req.body;
-    
-    if (!accessToken) {
-      return res.status(400).json({ error: 'Access token required' });
+    if (GOOGLE_WEB_CLIENT_IDS.length === 0) {
+      return res.status(500).json({ error: 'Google sign-in is not configured on the server yet.' });
     }
-    
-    // Verify token with Google
-    const googleResponse = await axios.get(
-      `https://www.googleapis.com/oauth2/v1/userinfo?access_token=${accessToken}`
-    );
-    
-    if (!googleResponse.data.email) {
-      return res.status(400).json({ error: 'Invalid Google token' });
-    }
-    
-    const email = googleResponse.data.email.toLowerCase();
-    let user = await User.findOne({ email });
-    
-    if (!user) {
-      // Create new user from Google OAuth
-      const randomPassword = await bcrypt.hash(Math.random().toString(36), 12);
-      user = await User.create({
-        email,
-        password: randomPassword,
-        googleId: googleResponse.data.id,
-        rank_title: 'Comrade',
-        rank_score: 1
-      });
-    } else {
-      // Update existing user's Google ID
-      if (!user.googleId) {
-        user.googleId = googleResponse.data.id;
-        await user.save();
+    let { accessToken, code, redirectUri } = req.body || {};
+
+    // Code flow: exchange the authorization code for an access token
+    if (!accessToken && code) {
+      if (!process.env.GOOGLE_CLIENT_SECRET) {
+        return res.status(500).json({ error: 'Google sign-in is not fully configured on the server (missing GOOGLE_CLIENT_SECRET).' });
       }
+      const tokenRes = await axios.post('https://oauth2.googleapis.com/token', new URLSearchParams({
+        code,
+        client_id: GOOGLE_WEB_CLIENT_IDS[0],
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code',
+      }).toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 });
+      accessToken = tokenRes.data && tokenRes.data.access_token;
     }
-    
-    // Generate JWT
+
+    if (!accessToken) {
+      return res.status(400).json({ error: 'Google access token or authorization code required' });
+    }
+
+    // Make sure the token was issued to OUR app (prevents tokens from other apps being replayed here)
+    const info = await axios.get('https://oauth2.googleapis.com/tokeninfo', { params: { access_token: accessToken }, timeout: 10000 })
+      .then((r) => r.data).catch(() => null);
+    if (!info || !GOOGLE_WEB_CLIENT_IDS.includes(info.aud || info.azp)) {
+      return res.status(401).json({ error: 'Invalid Google sign-in. Please try again.' });
+    }
+
+    const { data: profile } = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` }, timeout: 10000,
+    });
+
+    if (!profile || !profile.email) {
+      return res.status(400).json({ error: 'Google did not share an email address. Please allow email access and try again.' });
+    }
+    if (profile.email_verified === false) {
+      return res.status(400).json({ error: 'Your Google email address is not verified.' });
+    }
+
+    const email = profile.email.toLowerCase();
+    let user = await User.findOne({ email });
+
+    if (!user) {
+      // New user: create the account from their Google profile
+      const randomPassword = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 12);
+      try {
+        user = await User.create({
+          email,
+          password: randomPassword,
+          googleId: profile.sub,
+          rank_title: 'Comrade',
+          rank_score: 1
+        });
+      } catch (createErr) {
+        // Two near-simultaneous requests: the other one created the user first
+        if (createErr && createErr.code === 11000) user = await User.findOne({ email });
+        else throw createErr;
+      }
+      if (!user) throw new Error('Could not create or load user');
+    }
+    if (!user.googleId) {
+      // Existing email/password user: link their Google account
+      user.googleId = profile.sub;
+      await user.save();
+    }
+
     const token = generateToken(user._id, true);
 
     const cookieOptions = {
@@ -988,23 +1030,31 @@ app.post('/api/auth/google', async (req, res) => {
       _id: user._id
     });
   } catch (err) {
-    res.status(500).json({ error: 'Google authentication failed: ' + err.message });
+    const detail = (err.response && err.response.data && (err.response.data.error_description || err.response.data.error)) || err.message;
+    console.error('Google auth error:', detail);
+    res.status(500).json({ error: 'Google sign-in failed. Please try again.' });
   }
 });
 
 // SIGN UP
 app.post('/api/signup', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    if (password.length < 8) return res.status(400).json({ error: 'Password must be 8+ chars' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Please enter a valid email address' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
 
-    const existing = await User.findOne({ email: email.toLowerCase() });
-    if (existing) return res.status(400).json({ error: 'Account already exists' });
+    const existing = await User.findOne({ email });
+    if (existing) {
+      return res.status(409).json({ error: existing.googleId
+        ? 'An account with this email already exists. Please use "Continue with Google" to log in.'
+        : 'An account with this email already exists. Please log in instead.' });
+    }
 
     const hashed = await bcrypt.hash(password, 12);
     const user = await User.create({
-      email: email.toLowerCase(),
+      email,
       password: hashed,
       rank_score: 1,
       rank_title: 'Comrade'
@@ -1019,8 +1069,10 @@ app.post('/api/signup', async (req, res) => {
     };
     res.cookie('token', token, cookieOptions);
 
-    res.status(201).json({ message: 'Account created', token, email: user.email, rank_title: getRankTitle(user.rank_score || 1) });
+    res.status(201).json({ message: 'Account created', token, email: user.email, rank_title: getRankTitle(user.rank_score || 1), rank_score: user.rank_score || 1, _id: user._id });
   } catch (err) {
+    if (err && err.code === 11000) return res.status(409).json({ error: 'An account with this email already exists. Please log in instead.' });
+    console.error('Signup error:', err.message);
     res.status(500).json({ error: 'Signup failed' });
   }
 });
@@ -1049,7 +1101,8 @@ app.post('/api/login', async (req, res) => {
       token,
       email: user.email,
       rank_title: getRankTitle(user.rank_score || 1),
-      rank_score: user.rank_score || 1
+      rank_score: user.rank_score || 1,
+      _id: user._id
     });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
