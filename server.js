@@ -309,6 +309,7 @@ const {
 } = require('./lib/rankTiers');
 const { findNearestPlace, parseCoordinate, isPlacesConfigured } = require('./lib/places');
 const { validatePartnerApplication, publicPartnerSummary, toPublicDumaItem } = require('./lib/partners');
+const { fetchShopifyProducts, ImportError } = require('./lib/shopifyImport');
 const { fetchWholesaleProducts } = require('./lib/wholesale');
 
 // Premium Partner threshold — 900,000 points ("Supreme Lizard King"), matching the web and mobile apps
@@ -1428,6 +1429,30 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
   } catch (err) {
     console.error('Partner application error:', err.message);
     res.status(500).json({ error: 'Failed to submit partner application' });
+  }
+});
+
+// GET /api/partner/shopify-products?store=yourstore.myshopify.com
+// Reads a Marketplace Access applicant's public Shopify catalog so they can pick products to list.
+// Public (applicants may not be logged in yet), so it is rate limited per IP.
+const shopifyImportHits = new Map();
+const SHOPIFY_IMPORT_LIMIT = 10; // requests per IP per 10 minutes
+app.get('/api/partner/shopify-products', async (req, res) => {
+  const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+  const now = Date.now();
+  const recent = (shopifyImportHits.get(ip) || []).filter((t) => now - t < 10 * 60 * 1000);
+  if (recent.length >= SHOPIFY_IMPORT_LIMIT) return res.status(429).json({ error: 'Too many import attempts. Please wait a few minutes and try again.' });
+  recent.push(now);
+  shopifyImportHits.set(ip, recent);
+  if (shopifyImportHits.size > 5000) shopifyImportHits.clear();
+
+  try {
+    const result = await fetchShopifyProducts(req.query.store);
+    res.json(result);
+  } catch (err) {
+    if (err instanceof ImportError) return res.status(err.status).json({ error: err.message });
+    console.error('Shopify import error:', err.message);
+    res.status(502).json({ error: "We couldn't import products right now. Please try again or add them manually." });
   }
 });
 
