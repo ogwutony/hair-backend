@@ -309,6 +309,7 @@ const {
 } = require('./lib/rankTiers');
 const { findNearestPlace, parseCoordinate, isPlacesConfigured } = require('./lib/places');
 const { validatePartnerApplication, publicPartnerSummary, toPublicDumaItem } = require('./lib/partners');
+const { fetchWholesaleProducts } = require('./lib/wholesale');
 
 // Premium Partner threshold — 900,000 points ("Supreme Lizard King"), matching the web and mobile apps
 const PARTNER_PREMIUM_MIN = 900000;
@@ -466,6 +467,11 @@ const userSchema = new mongoose.Schema({
   blockedEmails: { type: [String], default: [] },
   termsAcceptedAt: { type: Date, default: null },
   termsVersion: { type: String, default: null },
+
+  // Wholesale access: granted automatically when the user submits a Brand & Retail Partners
+  // application (POST /api/duma/partner). Gates GET /api/wholesale/products.
+  wholesaleApproved: { type: Boolean, default: false },
+  wholesaleApprovedAt: { type: Date },
 
   // System / admin settings
   systemSettings: {
@@ -926,7 +932,8 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     email: user.email,
     rank_score: user.rank_score,
     rank_title: getRankTitle(user.rank_score || 1),
-    isPolitburoOrHigher: isPolitburoOrHigher(user.rank_score || 1)
+    isPolitburoOrHigher: isPolitburoOrHigher(user.rank_score || 1),
+    wholesaleApproved: !!user.wholesaleApproved
   });
 });
 
@@ -1389,6 +1396,13 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
 
     await updateRankScore(req.user._id, 10);
 
+    // Brand & Retail Partners get wholesale access straight away (no manual review step)
+    let wholesaleApproved = !!req.user.wholesaleApproved;
+    if (application.category === 'Brand & Retail Partners' && !wholesaleApproved) {
+      await User.updateOne({ _id: req.user._id }, { $set: { wholesaleApproved: true, wholesaleApprovedAt: new Date() } });
+      wholesaleApproved = true;
+    }
+
     if (MODERATION_EMAILS.length) {
       const rows = [
         ['Category', application.category], ['Company / name', application.company],
@@ -1409,10 +1423,32 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
     res.status(201).json({
       message: "Your partner application has been submitted to The Majority's Duma",
       item: toPublicDumaItem(item.toObject()),
+      wholesaleApproved,
     });
   } catch (err) {
     console.error('Partner application error:', err.message);
     res.status(500).json({ error: 'Failed to submit partner application' });
+  }
+});
+
+// GET /api/wholesale/products — wholesale catalog from Shopify (product type "Wholesale").
+// Only users with wholesaleApproved can read it; the Storefront token never leaves the server.
+app.get('/api/wholesale/products', authMiddleware, async (req, res) => {
+  if (!req.user.wholesaleApproved) {
+    return res.status(403).json({ error: 'Wholesale access is granted after you submit a Brand & Retail Partners application.' });
+  }
+  const shopDomain = process.env.SHOPIFY_STORE_DOMAIN || 'c0bqfe-z2.myshopify.com';
+  try {
+    const products = await fetchWholesaleProducts({
+      domain: shopDomain,
+      token: process.env.SHOPIFY_STOREFRONT_TOKEN,
+      apiVersion: process.env.SHOPIFY_STOREFRONT_API_VERSION || '2025-07',
+    });
+    res.json({ products, shopDomain });
+  } catch (err) {
+    console.error('Wholesale products error:', err.message);
+    if (err.code === 'NOT_CONFIGURED') return res.status(503).json({ error: 'The wholesale catalog is not available yet. Please check back soon.' });
+    res.status(502).json({ error: 'Could not load wholesale products right now. Please try again.' });
   }
 });
 
