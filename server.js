@@ -535,7 +535,7 @@ const dumaSchema = new mongoose.Schema({
   location: { type: String, default: "" },
   submitterDisplayName: { type: String, default: "" },
   mediaUrls: { type: [String], default: [] },
-  votes:      { yay: { type: Number, default: 0 }, nay: { type: Number, default: 0 } },
+  votes:      { yay: { type: Number, default: 0 }, nay: { type: Number, default: 0 }, abstain: { type: Number, default: 0 } },
   reportCount: { type: Number, default: 0 },
   hiddenByModeration: { type: Boolean, default: false }, // set by moderation / reports
   createdAt:  { type: Date, default: Date.now },
@@ -565,7 +565,7 @@ const Media = mongoose.model('Media', new mongoose.Schema({
 const voteSchema = new mongoose.Schema({
   userId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   targetId: { type: mongoose.Schema.Types.ObjectId, ref: 'DumaItem', required: true },
-  voteType: { type: String, enum: ['yay', 'nay'], required: true },
+  voteType: { type: String, enum: ['yay', 'nay', 'abstain'], required: true },
   createdAt: { type: Date, default: Date.now },
 });
 voteSchema.index({ userId: 1, targetId: 1 }, { unique: true });
@@ -1268,11 +1268,38 @@ app.get('/api/duma', async (req, res) => {
 });
 
 // 2. Voting Logic - Accept both "voteType" and "vote" parameters
+// The website and app send yes / no / abstain; older clients send yay / nay. Stored as yay / nay / abstain.
+const VOTE_ALIASES = { yes: 'yay', yay: 'yay', no: 'nay', nay: 'nay', abstain: 'abstain' };
+const VOTE_LABELS = { yay: 'yes', nay: 'no', abstain: 'abstain' };
+// Counts under both names, so any client version reads them correctly
+const voteCounts = (votes = {}) => {
+  const yay = votes.yay || 0;
+  const nay = votes.nay || 0;
+  const abstain = votes.abstain || 0;
+  return { yay, nay, abstain, yes: yay, no: nay };
+};
+
+// GET /api/duma/votes/mine - which posts the signed-in member has voted on: { votes: { [postId]: 'yes' | 'no' | 'abstain' } }
+app.get('/api/duma/votes/mine', authMiddleware, async (req, res) => {
+  try {
+    const votes = await Vote.find({ userId: req.user._id }).select('targetId voteType').lean();
+    res.json({ votes: Object.fromEntries(votes.map((v) => [String(v.targetId), VOTE_LABELS[v.voteType] || v.voteType])) });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not load your votes' });
+  }
+});
+
 app.post('/api/duma/:id/vote', authMiddleware, async (req, res) => {
   try {
-    const voteType = req.body.voteType || req.body.vote; // Support both parameter names
-    if (!['yay', 'nay'].includes(voteType)) {
-      return res.status(400).json({ error: 'Vote must be "yay" or "nay"' });
+    const voteType = VOTE_ALIASES[String(req.body.voteType || req.body.vote || '').toLowerCase()];
+    if (!voteType) {
+      return res.status(400).json({ error: 'Vote must be "yes", "no" or "abstain"' });
+    }
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+    if (!(await DumaItem.exists({ _id: req.params.id }))) {
+      return res.status(404).json({ error: 'Item not found' });
     }
 
     // Prevent double-voting via unique index; throws code 11000 on duplicate
@@ -1284,22 +1311,24 @@ app.post('/api/duma/:id/vote', authMiddleware, async (req, res) => {
       });
     } catch (dupErr) {
       if (dupErr.code === 11000) {
-        return res.status(409).json({ error: 'You have already voted on this item' });
+        const existing = await Vote.findOne({ userId: req.user._id, targetId: req.params.id }).lean();
+        const item = await DumaItem.findById(req.params.id).select('votes').lean();
+        return res.status(409).json({
+          error: 'You have already voted on this item',
+          yourVote: existing ? VOTE_LABELS[existing.voteType] : undefined,
+          votes: voteCounts(item && item.votes),
+        });
       }
       throw dupErr;
     }
 
-    const update = voteType === 'yay' ? 
-      { $inc: { 'votes.yay': 1 } } : 
-      { $inc: { 'votes.nay': 1 } };
-
-    const item = await DumaItem.findByIdAndUpdate(req.params.id, update, { new: true });
+    const item = await DumaItem.findByIdAndUpdate(req.params.id, { $inc: { [`votes.${voteType}`]: 1 } }, { new: true });
     if (!item) return res.status(404).json({ error: 'Item not found' });
 
     // Award points for voting
     await updateRankScore(req.user._id, 2);
 
-    res.json({ success: true, votes: item.votes });
+    res.json({ success: true, yourVote: VOTE_LABELS[voteType], votes: voteCounts(item.votes) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
