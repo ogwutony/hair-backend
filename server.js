@@ -1308,9 +1308,14 @@ app.post('/api/duma/:id/vote', authMiddleware, async (req, res) => {
 // 3. Submit recommendation to Duma
 app.post('/api/duma/recommend', requireBearerAuthorizationHeader, authMiddleware, async (req, res) => {
   try {
-    const { name, brand, webLink, reason, submitterAvatar } = req.body;
+    const { name, brand, webLink, reason, submitterAvatar, mediaUrls } = req.body;
     if (!name || !brand || !webLink || !reason) {
       return res.status(400).json({ error: 'All fields required: name, brand, webLink, reason' });
+    }
+    // Optional photos/videos (Cloudinary URLs from /api/media/upload), same limits as Culture posts
+    const isHttp = (v) => typeof v === 'string' && /^https?:\/\/\S+\.\S+/i.test(v.trim());
+    if (mediaUrls !== undefined && (!Array.isArray(mediaUrls) || mediaUrls.length > 6 || !mediaUrls.every(isHttp))) {
+      return res.status(400).json({ error: 'mediaUrls must be up to 6 http(s) URLs' });
     }
 
     const rankTitle = getRankTitle(req.user.rank_score || 1);
@@ -1325,7 +1330,8 @@ app.post('/api/duma/recommend', requireBearerAuthorizationHeader, authMiddleware
       submitterId: req.user._id,
       submitterProfilePictureUrl: resolveProfilePictureUrl(req.user),
       submitterSocialLinks: req.user.socialLinks || DEFAULT_SOCIAL_LINKS,
-      submitterAvatar: submitterAvatar || resolveProfilePictureUrl(req.user)
+      submitterAvatar: submitterAvatar || resolveProfilePictureUrl(req.user),
+      mediaUrls: Array.isArray(mediaUrls) ? mediaUrls.map((u) => u.trim()) : [],
     });
 
     await updateRankScore(req.user._id, 5);
@@ -1408,7 +1414,9 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
       const rows = [
         ['Category', application.category], ['Company / name', application.company],
         ['Contact', `${application.name} · ${application.contactEmail} · ${application.phoneNumber}`],
-        ['EIN', application.ein || '—'], ['Country', `${application.countryOfOrigin} → ${application.operatingCountry}`],
+        ['EIN', application.ein || '—'], application.venue
+          ? ['Venue', `${application.venue.name} · ${application.venue.address}`]
+          : ['Country', `${application.countryOfOrigin} → ${application.operatingCountry}`],
         ['Website / social', application.websiteOrSocial || '—'], ['Tier', application.tier],
         ...Object.entries(application.details).filter(([, v]) => v).map(([k, v]) => [k, v]),
         ['Media', media.map((m) => m.url).join('\n') || '—'], ['Submitted by', req.user.email],
@@ -1546,19 +1554,20 @@ app.put('/api/duma/:id', authMiddleware, async (req, res) => {
       if (update.name === '' || update.brand === '' || update.reason === '') {
         return res.status(400).json({ error: 'name, brand and reason cannot be empty' });
       }
-    } else {
+    }
+    if (mediaUrls !== undefined) {
+      if (!Array.isArray(mediaUrls) || mediaUrls.length > 6 || !mediaUrls.every(isHttpUrl)) {
+        return res.status(400).json({ error: 'mediaUrls must be up to 6 http(s) URLs' });
+      }
+      update.mediaUrls = mediaUrls.map((u) => u.trim());
+    }
+    if (item.type !== 'Product Recommendation') {
       if (prompt !== undefined) update.prompt = text(prompt, 500);
       if (response !== undefined) {
         update.response = text(response, 10000);
         update.perspective = update.response;
       }
       if (location !== undefined) update.location = text(location, 300);
-      if (mediaUrls !== undefined) {
-        if (!Array.isArray(mediaUrls) || mediaUrls.length > 6 || !mediaUrls.every(isHttpUrl)) {
-          return res.status(400).json({ error: 'mediaUrls must be up to 6 http(s) URLs' });
-        }
-        update.mediaUrls = mediaUrls.map((u) => u.trim());
-      }
     }
 
     if (Object.keys(update).length === 0) {
