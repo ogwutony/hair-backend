@@ -538,7 +538,8 @@ const dumaSchema = new mongoose.Schema({
   votes:      { yay: { type: Number, default: 0 }, nay: { type: Number, default: 0 } },
   reportCount: { type: Number, default: 0 },
   hiddenByModeration: { type: Boolean, default: false }, // set by moderation / reports
-  createdAt:  { type: Date, default: Date.now }
+  createdAt:  { type: Date, default: Date.now },
+  editedAt:   Date // set when the author edits the post (PUT /api/duma/:id)
 });
 
 dumaSchema.index({ section: 1, type: 1 });
@@ -1510,6 +1511,65 @@ app.delete('/api/duma/:id', authMiddleware, async (req, res) => {
     res.json({ success: true, message: "Post deleted successfully" });
   } catch (err) {
     res.status(500).json({ error: "Server error deleting post" });
+  }
+});
+
+// PUT /api/duma/:id - Allow users to edit their own Duma posts (text, media, recommendation fields)
+app.put('/api/duma/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(404).json({ error: "Post not found" });
+    }
+    const item = await DumaItem.findById(req.params.id);
+    if (!item) {
+      return res.status(404).json({ error: "Post not found" });
+    }
+
+    // Anti-tamper check: Ensure the requester owns the post
+    if (item.submittedBy !== req.user.email) {
+      return res.status(403).json({ error: "Unauthorized to edit this post" });
+    }
+
+    const isHttpUrl = (v) => typeof v === 'string' && /^https?:\/\/\S+\.\S+/i.test(v.trim());
+    const text = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : undefined);
+    const { prompt, response, location, mediaUrls, name, brand, webLink, reason } = req.body || {};
+    const update = {};
+
+    if (item.type === 'Product Recommendation') {
+      if (name !== undefined) update.name = text(name, 200);
+      if (brand !== undefined) update.brand = text(brand, 200);
+      if (reason !== undefined) update.reason = text(reason, 5000);
+      if (webLink !== undefined) {
+        if (!isHttpUrl(webLink)) return res.status(400).json({ error: 'webLink must be a full http(s) URL' });
+        update.webLink = webLink.trim();
+      }
+      if (update.name === '' || update.brand === '' || update.reason === '') {
+        return res.status(400).json({ error: 'name, brand and reason cannot be empty' });
+      }
+    } else {
+      if (prompt !== undefined) update.prompt = text(prompt, 500);
+      if (response !== undefined) {
+        update.response = text(response, 10000);
+        update.perspective = update.response;
+      }
+      if (location !== undefined) update.location = text(location, 300);
+      if (mediaUrls !== undefined) {
+        if (!Array.isArray(mediaUrls) || mediaUrls.length > 6 || !mediaUrls.every(isHttpUrl)) {
+          return res.status(400).json({ error: 'mediaUrls must be up to 6 http(s) URLs' });
+        }
+        update.mediaUrls = mediaUrls.map((u) => u.trim());
+      }
+    }
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'Nothing to update' });
+    }
+    update.editedAt = new Date();
+
+    const updated = await DumaItem.findByIdAndUpdate(req.params.id, { $set: update }, { new: true });
+    res.json({ success: true, item: updated });
+  } catch (err) {
+    res.status(500).json({ error: "Server error editing post" });
   }
 });
 
