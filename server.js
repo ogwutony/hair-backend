@@ -2365,19 +2365,23 @@ app.get('/api/auth/social-status', authMiddleware, async (req, res) => {
 });
 
 // POST /api/profile/share — publish a video to connected social platforms
-// Body: { videoUrl: string (absolute Cloudinary URL), platforms: ['instagram','tiktok','facebook'], caption: string }
+// Body: { videoUrl?: string, imageUrl?: string (absolute public URLs), platforms: ['instagram','tiktok','facebook'], caption: string }
+// Provide videoUrl (all platforms) or imageUrl (instagram/facebook only). Tokens are read server-side from the user's account.
 app.post('/api/profile/share', authMiddleware, async (req, res) => {
-  const { videoUrl, platforms, caption } = req.body;
+  const { videoUrl, imageUrl, platforms, caption } = req.body;
 
-  if (!videoUrl || !platforms || !Array.isArray(platforms) || platforms.length === 0) {
-    return res.status(400).json({ error: 'videoUrl and platforms[] are required' });
+  if ((!videoUrl && !imageUrl) || !platforms || !Array.isArray(platforms) || platforms.length === 0) {
+    return res.status(400).json({ error: 'videoUrl or imageUrl, and platforms[] are required' });
   }
 
-  // Validate videoUrl is an absolute https URL (must be Cloudinary or public CDN)
-  let parsedUrl;
-  try { parsedUrl = new URL(videoUrl); } catch (_) { return res.status(400).json({ error: 'videoUrl must be a valid absolute URL' }); }
-  if (!['https:', 'http:'].includes(parsedUrl.protocol)) {
-    return res.status(400).json({ error: 'videoUrl must use http or https' });
+  // Validate media URLs are absolute http(s) URLs (must be Cloudinary or public CDN)
+  for (const [name, value] of [['videoUrl', videoUrl], ['imageUrl', imageUrl]]) {
+    if (!value) continue;
+    let parsedUrl;
+    try { parsedUrl = new URL(value); } catch (_) { return res.status(400).json({ error: `${name} must be a valid absolute URL` }); }
+    if (!['https:', 'http:'].includes(parsedUrl.protocol)) {
+      return res.status(400).json({ error: `${name} must use http or https` });
+    }
   }
 
   const tokens = req.user.socialTokens || {};
@@ -2394,9 +2398,12 @@ app.post('/api/profile/share', authMiddleware, async (req, res) => {
     } else {
       try {
         // Step 1: Create media container
+        const containerBody = videoUrl
+          ? { video_url: videoUrl, caption: caption || '', media_type: 'REELS', share_to_feed: true, access_token: ig.accessToken }
+          : { image_url: imageUrl, caption: caption || '', access_token: ig.accessToken };
         const containerRes = await axios.post(
           `https://graph.facebook.com/v19.0/${ig.instagramBusinessAccountId}/media`,
-          { video_url: videoUrl, caption: caption || '', media_type: 'REELS', share_to_feed: true, access_token: ig.accessToken }
+          containerBody
         );
         const containerId = containerRes.data.id;
 
@@ -2429,7 +2436,9 @@ app.post('/api/profile/share', authMiddleware, async (req, res) => {
   // --- TIKTOK ---
   if (platforms.includes('tiktok')) {
     const tt = tokens.tiktok || {};
-    if (!tt.accessToken || !tt.openId) {
+    if (!videoUrl) {
+      results.tiktok = { success: false, error: 'TikTok requires a videoUrl.' };
+    } else if (!tt.accessToken || !tt.openId) {
       results.tiktok = { success: false, error: 'TikTok not connected. Visit /api/auth/tiktok to connect.' };
     } else if (tt.expiresAt && new Date(tt.expiresAt) <= now) {
       results.tiktok = { success: false, error: 'TikTok token expired. Please reconnect.' };
@@ -2460,10 +2469,15 @@ app.post('/api/profile/share', authMiddleware, async (req, res) => {
       results.facebook = { success: false, error: 'Facebook token expired. Please reconnect.' };
     } else {
       try {
-        const fbRes = await axios.post(
-          `https://graph.facebook.com/v19.0/${fb.pageOrUserId}/videos`,
-          { file_url: videoUrl, description: caption || '', published: true, access_token: fb.accessToken }
-        );
+        const fbRes = videoUrl
+          ? await axios.post(
+              `https://graph.facebook.com/v19.0/${fb.pageOrUserId}/videos`,
+              { file_url: videoUrl, description: caption || '', published: true, access_token: fb.accessToken }
+            )
+          : await axios.post(
+              `https://graph.facebook.com/v19.0/${fb.pageOrUserId}/photos`,
+              { url: imageUrl, caption: caption || '', published: true, access_token: fb.accessToken }
+            );
         results.facebook = { success: true, videoId: fbRes.data.id };
       } catch (err) {
         results.facebook = { success: false, error: err.response?.data?.error?.message || err.message };
