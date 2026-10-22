@@ -1863,7 +1863,7 @@ const CultureLabPage = ({ addDumaItem, userEmail, rankTitle, rankScore, authToke
       if (authToken) {
         const res = await fetch(`${BACKEND_URL}/api/duma/culture`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+          headers: { 'Content-Type': 'application/json', Authorization: `****** },
           body: JSON.stringify({
             prompt: selectedPrompt,
             response: response,
@@ -2048,6 +2048,30 @@ const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoin
     }).catch(() => {}); 
   }, [items]);
   
+  const handleSocialShare = async (item, platform) => {
+    const caption = `${item.prompt || ''}\n\n${item.response || item.reason || item.desc || ''}`.trim();
+    const mediaUrl = item.videoUrl || (Array.isArray(item.mediaUrls) ? item.mediaUrls[0] : '') || '';
+    if (!mediaUrl) return alert('No media attachment found to publish!');
+    const isVideo = !!item.videoUrl || /\.(mp4|mov|webm)(\?.*)?$/i.test(mediaUrl);
+    if (platform === 'tiktok' && !isVideo) return alert('TikTok requires a video to publish posts.');
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/profile/share`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `****** },
+        body: JSON.stringify({ platforms: [platform], caption, ...(isVideo ? { videoUrl: mediaUrl } : { imageUrl: mediaUrl }) })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data.results?.[platform]?.success) {
+        alert(`Successfully shared to ${platform}!`);
+      } else {
+        alert(`Failed to share to ${platform}: ${data.results?.[platform]?.error || data.error || 'Share failed'}`);
+      }
+    } catch (err) {
+      console.error(`Error sharing to ${platform}:`, err);
+      alert('An error occurred while connecting to the server.');
+    }
+  };
+
   const handleVote = async (itemId, voteType) => {
     if (!authToken) return alert("Please log in to vote.");
     if (userVotes[itemId]) return; // Already voted
@@ -2119,6 +2143,14 @@ const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoin
                 <h4 style={{ marginTop: '12px', marginBottom: '8px', color: '#555' }}>Prompt: "{item.prompt || 'What makes a person beautiful?'}"</h4>
                 <p style={{ color: '#222', fontSize: '14px', lineHeight: '1.6', marginBottom: '14px' }}>{item.response || item.reason || item.desc}</p>
                 
+                {authToken && userEmail && item.submittedBy === userEmail && (item.videoUrl || item.mediaUrls?.length > 0) && (
+                  <div style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
+                    {['instagram', 'tiktok', 'facebook'].map(p => (
+                      <button key={p} onClick={() => handleSocialShare(item, p)} style={{ padding: '8px 14px', backgroundColor: '#fff', color: '#222', border: '1px solid #ddd', borderRadius: '6px', cursor: 'pointer', fontSize: '12px', fontWeight: '600' }}>Share to {p === 'tiktok' ? 'TikTok' : p[0].toUpperCase() + p.slice(1)}</button>
+                    ))}
+                  </div>
+                )}
+
                 {authToken && (
                   <div>
                     <div style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
