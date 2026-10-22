@@ -1863,7 +1863,7 @@ const CultureLabPage = ({ addDumaItem, userEmail, rankTitle, rankScore, authToke
       if (authToken) {
         const res = await fetch(`${BACKEND_URL}/api/duma/culture`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `****** },
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
           body: JSON.stringify({
             prompt: selectedPrompt,
             response: response,
@@ -2057,7 +2057,7 @@ const DumaPage = ({ items, authToken, userEmail, rankTitle, rankScore, onAddPoin
     try {
       const response = await fetch(`${BACKEND_URL}/api/profile/share`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `****** },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
         body: JSON.stringify({ platforms: [platform], caption, ...(isVideo ? { videoUrl: mediaUrl } : { imageUrl: mediaUrl }) })
       });
       const data = await response.json().catch(() => ({}));
