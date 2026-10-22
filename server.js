@@ -2234,19 +2234,44 @@ app.get('/api/leaderboard', async (req, res) => {
 
 // --- FACEBOOK / INSTAGRAM OAUTH ---
 
-// GET /api/auth/facebook — redirect user to Facebook OAuth consent screen
-app.get('/api/auth/facebook', (req, res) => {
-  const { META_APP_ID, FRONTEND_URL } = process.env;
-  const redirectUri = encodeURIComponent((process.env.BACKEND_URL || 'https://hair-backend-orpin.vercel.app') + '/api/auth/facebook/callback');
-  const scopes = 'email,public_profile,pages_show_list,pages_manage_posts,instagram_content_publish';
-  const fbUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${META_APP_ID}&redirect_uri=${redirectUri}&scope=${scopes}&response_type=code`;
-  res.redirect(fbUrl);
+// OAuth redirects from the browser can't carry an Authorization header, so the client
+// first POSTs here (authenticated) to get a provider URL containing a short-lived signed
+// `state` that identifies the user in the callback and protects against CSRF.
+const signSocialState = (userId, platform) =>
+  jwt.sign({ userId: String(userId), purpose: 'social-connect', platform }, JWT_SECRET, { expiresIn: '10m' });
+
+const userIdFromSocialState = (state, platform) => {
+  try {
+    const d = jwt.verify(String(state || ''), JWT_SECRET);
+    return d.purpose === 'social-connect' && d.platform === platform ? d.userId : null;
+  } catch (_) { return null; }
+};
+
+const FACEBOOK_SCOPES = 'email,public_profile,pages_show_list,pages_manage_posts,instagram_basic,instagram_content_publish';
+const TIKTOK_SCOPES = 'user.info.basic,video.upload,video.publish';
+
+// POST /api/auth/social/:platform/connect — returns { url } to send the user to (platform: facebook | tiktok)
+app.post('/api/auth/social/:platform/connect', authMiddleware, (req, res) => {
+  const { platform } = req.params;
+  const backend = process.env.BACKEND_URL || 'https://hair-backend-orpin.vercel.app';
+  const state = signSocialState(req.user._id, platform);
+  if (platform === 'facebook') {
+    const redirectUri = encodeURIComponent(backend + '/api/auth/facebook/callback');
+    return res.json({ url: `https://www.facebook.com/v19.0/dialog/oauth?client_id=${encodeURIComponent(process.env.META_APP_ID || '')}&redirect_uri=${redirectUri}&scope=${FACEBOOK_SCOPES}&response_type=code&state=${encodeURIComponent(state)}` });
+  }
+  if (platform === 'tiktok') {
+    const redirectUri = encodeURIComponent(backend + '/api/auth/tiktok/callback');
+    return res.json({ url: `https://www.tiktok.com/v2/auth/authorize/?client_key=${encodeURIComponent(process.env.TIKTOK_CLIENT_KEY || '')}&response_type=code&scope=${encodeURIComponent(TIKTOK_SCOPES)}&redirect_uri=${redirectUri}&state=${encodeURIComponent(state)}` });
+  }
+  res.status(400).json({ error: 'platform must be facebook or tiktok' });
 });
 
 // GET /api/auth/facebook/callback — exchange code for long-lived token & save
-app.get('/api/auth/facebook/callback', authMiddleware, async (req, res) => {
+app.get('/api/auth/facebook/callback', async (req, res) => {
   try {
-    const { code } = req.query;
+    const { code, state } = req.query;
+    const userId = userIdFromSocialState(state, 'facebook');
+    if (!userId) return res.status(401).json({ error: 'Invalid or expired state. Please retry connecting.' });
     if (!code) return res.status(400).json({ error: 'No code returned from Facebook' });
 
     const { META_APP_ID, META_APP_SECRET, FRONTEND_URL } = process.env;
@@ -2291,7 +2316,7 @@ app.get('/api/auth/facebook/callback', authMiddleware, async (req, res) => {
 
     const expiresAt = new Date(Date.now() + expiresIn * 1000);
 
-    await User.findByIdAndUpdate(req.user._id, {
+    await User.findByIdAndUpdate(userId, {
       'socialTokens.facebook.accessToken': longToken,
       'socialTokens.facebook.expiresAt': expiresAt,
       'socialTokens.facebook.pageOrUserId': pageOrUserId,
@@ -2309,20 +2334,12 @@ app.get('/api/auth/facebook/callback', authMiddleware, async (req, res) => {
 
 // --- TIKTOK OAUTH ---
 
-// GET /api/auth/tiktok — redirect user to TikTok OAuth consent screen
-app.get('/api/auth/tiktok', (req, res) => {
-  const { TIKTOK_CLIENT_KEY, BACKEND_URL, FRONTEND_URL } = process.env;
-  const redirectUri = encodeURIComponent((BACKEND_URL || 'https://hair-backend-orpin.vercel.app') + '/api/auth/tiktok/callback');
-  const csrfState = crypto.randomBytes(16).toString('hex');
-  const scopes = 'video.upload,share.sound.create';
-  const ttUrl = `https://www.tiktok.com/v2/auth/authorize/?client_key=${TIKTOK_CLIENT_KEY}&response_type=code&scope=${scopes}&redirect_uri=${redirectUri}&state=${csrfState}`;
-  res.redirect(ttUrl);
-});
-
 // GET /api/auth/tiktok/callback — exchange code for tokens & save
-app.get('/api/auth/tiktok/callback', authMiddleware, async (req, res) => {
+app.get('/api/auth/tiktok/callback', async (req, res) => {
   try {
-    const { code } = req.query;
+    const { code, state } = req.query;
+    const userId = userIdFromSocialState(state, 'tiktok');
+    if (!userId) return res.status(401).json({ error: 'Invalid or expired state. Please retry connecting.' });
     if (!code) return res.status(400).json({ error: 'No code returned from TikTok' });
 
     const { TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET, BACKEND_URL, FRONTEND_URL } = process.env;
@@ -2339,7 +2356,7 @@ app.get('/api/auth/tiktok/callback', authMiddleware, async (req, res) => {
     const { access_token, refresh_token, expires_in, open_id } = tokenRes.data;
     const expiresAt = new Date(Date.now() + (expires_in || 86400) * 1000);
 
-    await User.findByIdAndUpdate(req.user._id, {
+    await User.findByIdAndUpdate(userId, {
       'socialTokens.tiktok.accessToken': access_token,
       'socialTokens.tiktok.refreshToken': refresh_token,
       'socialTokens.tiktok.expiresAt': expiresAt,
@@ -2365,19 +2382,23 @@ app.get('/api/auth/social-status', authMiddleware, async (req, res) => {
 });
 
 // POST /api/profile/share — publish a video to connected social platforms
-// Body: { videoUrl: string (absolute Cloudinary URL), platforms: ['instagram','tiktok','facebook'], caption: string }
+// Body: { videoUrl?: string, imageUrl?: string (absolute public URLs), platforms: ['instagram','tiktok','facebook'], caption: string }
+// Provide videoUrl (all platforms) or imageUrl (instagram/facebook only). Tokens are read server-side from the user's account.
 app.post('/api/profile/share', authMiddleware, async (req, res) => {
-  const { videoUrl, platforms, caption } = req.body;
+  const { videoUrl, imageUrl, platforms, caption } = req.body;
 
-  if (!videoUrl || !platforms || !Array.isArray(platforms) || platforms.length === 0) {
-    return res.status(400).json({ error: 'videoUrl and platforms[] are required' });
+  if ((!videoUrl && !imageUrl) || !platforms || !Array.isArray(platforms) || platforms.length === 0) {
+    return res.status(400).json({ error: 'videoUrl or imageUrl, and platforms[] are required' });
   }
 
-  // Validate videoUrl is an absolute https URL (must be Cloudinary or public CDN)
-  let parsedUrl;
-  try { parsedUrl = new URL(videoUrl); } catch (_) { return res.status(400).json({ error: 'videoUrl must be a valid absolute URL' }); }
-  if (!['https:', 'http:'].includes(parsedUrl.protocol)) {
-    return res.status(400).json({ error: 'videoUrl must use http or https' });
+  // Validate media URLs are absolute http(s) URLs (must be Cloudinary or public CDN)
+  for (const [name, value] of [['videoUrl', videoUrl], ['imageUrl', imageUrl]]) {
+    if (!value) continue;
+    let parsedUrl;
+    try { parsedUrl = new URL(value); } catch (_) { return res.status(400).json({ error: `${name} must be a valid absolute URL` }); }
+    if (!['https:', 'http:'].includes(parsedUrl.protocol)) {
+      return res.status(400).json({ error: `${name} must use http or https` });
+    }
   }
 
   const tokens = req.user.socialTokens || {};
@@ -2388,15 +2409,18 @@ app.post('/api/profile/share', authMiddleware, async (req, res) => {
   if (platforms.includes('instagram')) {
     const ig = tokens.instagram || {};
     if (!ig.accessToken || !ig.instagramBusinessAccountId) {
-      results.instagram = { success: false, error: 'Instagram not connected. Visit /api/auth/facebook to connect.' };
+      results.instagram = { success: false, error: 'Instagram not connected. Connect your account from your profile.' };
     } else if (ig.expiresAt && new Date(ig.expiresAt) <= now) {
       results.instagram = { success: false, error: 'Instagram token expired. Please reconnect.' };
     } else {
       try {
         // Step 1: Create media container
+        const containerBody = videoUrl
+          ? { video_url: videoUrl, caption: caption || '', media_type: 'REELS', share_to_feed: true, access_token: ig.accessToken }
+          : { image_url: imageUrl, caption: caption || '', access_token: ig.accessToken };
         const containerRes = await axios.post(
           `https://graph.facebook.com/v19.0/${ig.instagramBusinessAccountId}/media`,
-          { video_url: videoUrl, caption: caption || '', media_type: 'REELS', share_to_feed: true, access_token: ig.accessToken }
+          containerBody
         );
         const containerId = containerRes.data.id;
 
@@ -2429,8 +2453,10 @@ app.post('/api/profile/share', authMiddleware, async (req, res) => {
   // --- TIKTOK ---
   if (platforms.includes('tiktok')) {
     const tt = tokens.tiktok || {};
-    if (!tt.accessToken || !tt.openId) {
-      results.tiktok = { success: false, error: 'TikTok not connected. Visit /api/auth/tiktok to connect.' };
+    if (!videoUrl) {
+      results.tiktok = { success: false, error: 'TikTok requires a videoUrl.' };
+    } else if (!tt.accessToken || !tt.openId) {
+      results.tiktok = { success: false, error: 'TikTok not connected. Connect your account from your profile.' };
     } else if (tt.expiresAt && new Date(tt.expiresAt) <= now) {
       results.tiktok = { success: false, error: 'TikTok token expired. Please reconnect.' };
     } else {
@@ -2455,15 +2481,20 @@ app.post('/api/profile/share', authMiddleware, async (req, res) => {
   if (platforms.includes('facebook')) {
     const fb = tokens.facebook || {};
     if (!fb.accessToken || !fb.pageOrUserId) {
-      results.facebook = { success: false, error: 'Facebook not connected. Visit /api/auth/facebook to connect.' };
+      results.facebook = { success: false, error: 'Facebook not connected. Connect your account from your profile.' };
     } else if (fb.expiresAt && new Date(fb.expiresAt) <= now) {
       results.facebook = { success: false, error: 'Facebook token expired. Please reconnect.' };
     } else {
       try {
-        const fbRes = await axios.post(
-          `https://graph.facebook.com/v19.0/${fb.pageOrUserId}/videos`,
-          { file_url: videoUrl, description: caption || '', published: true, access_token: fb.accessToken }
-        );
+        const fbRes = videoUrl
+          ? await axios.post(
+              `https://graph.facebook.com/v19.0/${fb.pageOrUserId}/videos`,
+              { file_url: videoUrl, description: caption || '', published: true, access_token: fb.accessToken }
+            )
+          : await axios.post(
+              `https://graph.facebook.com/v19.0/${fb.pageOrUserId}/photos`,
+              { url: imageUrl, caption: caption || '', published: true, access_token: fb.accessToken }
+            );
         results.facebook = { success: true, videoId: fbRes.data.id };
       } catch (err) {
         results.facebook = { success: false, error: err.response?.data?.error?.message || err.message };
