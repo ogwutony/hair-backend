@@ -583,6 +583,24 @@ const ProfilePage = ({ userEmail, savedSets, rankTitle, rankScore, authToken, on
   const pointsToNextRank = getPointsToNextRank(rankScore || 1, rankTitle || 'Comrade');
   const nextRankTitle = getNextRankTitle(rankTitle || 'Comrade');
 
+  const [socialStatus, setSocialStatus] = useState({});
+  useEffect(() => {
+    if (!authToken) return;
+    fetch(`${BACKEND_URL}/api/auth/social-status`, { headers: { Authorization: `Bearer ${authToken}` } })
+      .then(r => r.json()).then(d => setSocialStatus(d || {})).catch(() => {});
+  }, [authToken]);
+
+  const connectSocial = async (platform) => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/auth/social/${platform}/connect`, { method: 'POST', headers: { Authorization: `Bearer ${authToken}` } });
+      const data = await res.json();
+      if (res.ok && data.url) window.location.href = data.url;
+      else alert(data.error || `Could not start ${platform} connection.`);
+    } catch (err) {
+      alert('An error occurred while connecting to the server.');
+    }
+  };
+
   const handleSocialShare = (platform, username) => {
     if (!username) {
       alert(`Connect your ${platform} account first in Social Links above.`);
@@ -825,6 +843,18 @@ const ProfilePage = ({ userEmail, savedSets, rankTitle, rankScore, authToken, on
               </div>
             ))}
           </div>
+        </div>
+      </section>
+
+      {/* CONNECT SOCIAL ACCOUNTS */}
+      <section style={{ marginBottom: '30px' }}>
+        <h2 style={{ fontSize: '20px', marginBottom: '16px', fontWeight: '600' }}>Connect Social Accounts</h2>
+        <div style={{ ...styles.dumaCard, display: 'flex', gap: '12px', flexWrap: 'wrap', justifyContent: 'center', padding: '24px' }}>
+          {[['facebook', 'Facebook / Instagram', socialStatus.facebook || socialStatus.instagram], ['tiktok', 'TikTok', socialStatus.tiktok]].map(([key, label, connected]) => (
+            <button key={key} onClick={() => connectSocial(key)} style={{ ...styles.socialButton, maxWidth: '240px' }}>
+              {connected ? `${label} connected ✓ (reconnect)` : `Connect ${label}`}
+            </button>
+          ))}
         </div>
       </section>
 
