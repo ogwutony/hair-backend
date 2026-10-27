@@ -310,6 +310,7 @@ const {
 const { findNearestPlace, parseCoordinate, isPlacesConfigured } = require('./lib/places');
 const { validatePartnerApplication, publicPartnerSummary, toPublicDumaItem } = require('./lib/partners');
 const { fetchWholesaleProducts } = require('./lib/wholesale');
+const { rejectIfObjectionable } = require('./lib/contentFilter');
 
 // Premium Partner threshold — 900,000 points ("Supreme Lizard King"), matching the web and mobile apps
 const PARTNER_PREMIUM_MIN = 900000;
@@ -467,6 +468,10 @@ const userSchema = new mongoose.Schema({
   blockedEmails: { type: [String], default: [] },
   termsAcceptedAt: { type: Date, default: null },
   termsVersion: { type: String, default: null },
+  // Moderation: ejected users can't sign in, post or message (Guideline 1.2 — act on reports within 24h)
+  banned: { type: Boolean, default: false, index: true },
+  bannedAt: { type: Date, default: null },
+  banReason: { type: String, default: null },
 
   // Wholesale access: granted automatically when the user submits a Brand & Retail Partners
   // application (POST /api/duma/partner). Gates GET /api/wholesale/products.
@@ -538,6 +543,20 @@ const dumaSchema = new mongoose.Schema({
   votes:      { yay: { type: Number, default: 0 }, nay: { type: Number, default: 0 }, abstain: { type: Number, default: 0 } },
   reportCount: { type: Number, default: 0 },
   hiddenByModeration: { type: Boolean, default: false }, // set by moderation / reports
+  // Comments (text and/or up to 5 images), shown on the website and in the app
+  comments: {
+    type: [{
+      author: String,            // commenter email
+      authorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+      authorDisplayName: String,
+      text: String,
+      imageUrls: { type: [String], default: [] },
+      reportCount: { type: Number, default: 0 },
+      hiddenByModeration: { type: Boolean, default: false },
+      createdAt: { type: Date, default: Date.now },
+    }],
+    default: [],
+  },
   createdAt:  { type: Date, default: Date.now },
   editedAt:   Date // set when the author edits the post (PUT /api/duma/:id)
 });
@@ -600,7 +619,7 @@ messageSchema.index({ conversationId: 1, createdAt: -1 });
 const Message = mongoose.model('Message', messageSchema);
 
 // User reports of objectionable content (App Store Guideline 1.2)
-const REPORT_CONTENT_TYPES = ['duma', 'marketplace', 'user', 'message'];
+const REPORT_CONTENT_TYPES = ['duma', 'comment', 'marketplace', 'user', 'message'];
 const reportSchema = new mongoose.Schema({
   reporterId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   reporterEmail: String,
@@ -626,6 +645,8 @@ const generateToken = (userId, rememberMe = false) => {
   });
 };
 
+const BANNED_MESSAGE = 'This account has been removed for breaking our Community Guidelines.';
+
 const authMiddleware = async (req, res, next) => {
   // 1. Prefer token pre-validated by route-level middleware, if present
   let token = req.bearerToken;
@@ -649,6 +670,7 @@ const authMiddleware = async (req, res, next) => {
     const decoded = jwt.verify(token, JWT_SECRET);
     const user = await User.findById(decoded.userId);
     if (!user) return res.status(401).json({ error: 'User not found' });
+    if (user.banned) return res.status(403).json({ error: BANNED_MESSAGE, banned: true });
     req.user = user;
     next();
   } catch (err) {
@@ -934,7 +956,10 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     rank_score: user.rank_score,
     rank_title: getRankTitle(user.rank_score || 1),
     isPolitburoOrHigher: isPolitburoOrHigher(user.rank_score || 1),
-    wholesaleApproved: !!user.wholesaleApproved
+    wholesaleApproved: !!user.wholesaleApproved,
+    termsAcceptedAt: user.termsAcceptedAt || null,
+    termsVersion: user.termsVersion || null,
+    blocked: user.blockedEmails || [],
   });
 });
 
@@ -1014,6 +1039,7 @@ app.post('/api/auth/google', async (req, res) => {
       }
       if (!user) throw new Error('Could not create or load user');
     }
+    if (user.banned) return res.status(403).json({ error: BANNED_MESSAGE, banned: true });
     if (!user.googleId) {
       // Existing email/password user: link their Google account
       user.googleId = profile.sub;
@@ -1054,6 +1080,7 @@ app.post('/api/signup', async (req, res) => {
     if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
 
     const existing = await User.findOne({ email });
+    if (existing?.banned) return res.status(403).json({ error: BANNED_MESSAGE, banned: true });
     if (existing) {
       return res.status(409).json({ error: existing.googleId
         ? 'An account with this email already exists. Please use "Continue with Google" to log in.'
@@ -1065,7 +1092,9 @@ app.post('/api/signup', async (req, res) => {
       email,
       password: hashed,
       rank_score: 1,
-      rank_title: 'Comrade'
+      rank_title: 'Comrade',
+      // The sign-up form requires agreeing to the Terms of Use / EULA before the account is created
+      ...(req.body?.termsAccepted ? { termsAcceptedAt: new Date(), termsVersion: String(req.body?.termsVersion || '').slice(0, 40) || null } : {}),
     });
     const token = generateToken(user._id, false);
 
@@ -1095,6 +1124,7 @@ app.post('/api/login', async (req, res) => {
 
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+    if (user.banned) return res.status(403).json({ error: BANNED_MESSAGE, banned: true });
 
     const token = generateToken(user._id, !!rememberMe);
     const cookieOptions = {
@@ -1245,6 +1275,11 @@ app.get('/api/duma', async (req, res) => {
         if (viewerBlocked.has(String(enriched[i].submittedBy || '').toLowerCase())) enriched.splice(i, 1);
       }
     }
+    // Comments: drop ones removed by moderation and ones written by people the viewer blocked
+    for (const entry of enriched) {
+      entry.comments = (entry.comments || []).filter((c) =>
+        !c.hiddenByModeration && !viewerBlocked.has(String(c.author || '').toLowerCase()));
+    }
 
     // De-duplicate by submittedBy email — keep only the most recent item per user
     if (deduplicate === 'true') {
@@ -1341,6 +1376,7 @@ app.post('/api/duma/recommend', requireBearerAuthorizationHeader, authMiddleware
     if (!name || !brand || !webLink || !reason) {
       return res.status(400).json({ error: 'All fields required: name, brand, webLink, reason' });
     }
+    if (rejectIfObjectionable(res, name, brand, reason)) return;
     // Optional photos/videos (Cloudinary URLs from /api/media/upload), same limits as Culture posts
     const isHttp = (v) => typeof v === 'string' && /^https?:\/\/\S+\.\S+/i.test(v.trim());
     if (mediaUrls !== undefined && (!Array.isArray(mediaUrls) || mediaUrls.length > 6 || !mediaUrls.every(isHttp))) {
@@ -1390,6 +1426,7 @@ const parsePartnerUpload = (req, res, next) => {
 app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, parsePartnerUpload, async (req, res) => {
   const { error, application } = validatePartnerApplication(req.body || {});
   if (error) return res.status(400).json({ error });
+  if (rejectIfObjectionable(res, application.company, publicPartnerSummary(application))) return;
 
   try {
     const rankScore = req.user.rank_score || 1;
@@ -1494,6 +1531,7 @@ app.get('/api/wholesale/products', authMiddleware, async (req, res) => {
 app.post('/api/duma/culture', authMiddleware, async (req, res) => {
   try {
     const { prompt, response, videoUrl, perspective, category, submitterAvatar, location, mediaUrls } = req.body;
+    if (rejectIfObjectionable(res, prompt, response, perspective, location)) return;
     const rankTitle = getRankTitle(req.user.rank_score || 1);
     const isVideoSubmission = Boolean(videoUrl);
 
@@ -1570,6 +1608,7 @@ app.put('/api/duma/:id', authMiddleware, async (req, res) => {
     const isHttpUrl = (v) => typeof v === 'string' && /^https?:\/\/\S+\.\S+/i.test(v.trim());
     const text = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : undefined);
     const { prompt, response, location, mediaUrls, name, brand, webLink, reason } = req.body || {};
+    if (rejectIfObjectionable(res, prompt, response, location, name, brand, reason)) return;
     const update = {};
 
     if (item.type === 'Product Recommendation') {
@@ -1608,6 +1647,116 @@ app.put('/api/duma/:id', authMiddleware, async (req, res) => {
     res.json({ success: true, item: updated });
   } catch (err) {
     res.status(500).json({ error: "Server error editing post" });
+  }
+});
+
+// ========== COMMENTS (text + up to 5 images) ==========
+const commentImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5242880, files: 5 },
+  fileFilter: (req, file, cb) => {
+    // The app labels some photos image/jpg or image/heic — let Cloudinary convert them
+    if (/^image\/(jpe?g|png|webp|heic|heif)$/i.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Only JPEG, PNG, WebP or HEIC images are allowed'));
+  },
+});
+const parseCommentImages = (req, res, next) => {
+  commentImageUpload.array('images', 5)(req, res, (error) => {
+    if (!error) return next();
+    const message = error.code === 'LIMIT_FILE_SIZE'
+      ? 'Each image must be 5 MB or smaller'
+      : error.code === 'LIMIT_FILE_COUNT' || error.code === 'LIMIT_UNEXPECTED_FILE'
+        ? 'You can attach up to 5 images'
+        : error.message || 'Invalid image';
+    return res.status(400).json({ error: message });
+  });
+};
+
+// POST /api/posts/:postId/comments (multipart: text, images[]) — also /api/duma/:postId/comments
+const createCommentHandler = async (req, res) => {
+  try {
+    const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+    const files = req.files || [];
+    if (text.length > 2000) return res.status(400).json({ error: 'Comments must be 2,000 characters or fewer' });
+    if (!text && files.length === 0) return res.status(400).json({ error: 'A comment or image is required' });
+    if (rejectIfObjectionable(res, text)) return;
+    if (!mongoose.Types.ObjectId.isValid(req.params.postId)) return res.status(404).json({ error: 'Post not found' });
+
+    const item = await DumaItem.findById(req.params.postId);
+    if (!item || item.hiddenByModeration) return res.status(404).json({ error: 'Post not found' });
+
+    // Blocking stops interaction both ways: no commenting on posts by someone who blocked you, or whom you blocked
+    const authorEmail = String(item.submittedBy || '').toLowerCase();
+    const me = req.user.email.toLowerCase();
+    if ((req.user.blockedEmails || []).map((e) => e.toLowerCase()).includes(authorEmail)) {
+      return res.status(403).json({ error: 'You have blocked this user' });
+    }
+    if (authorEmail && authorEmail !== me) {
+      const author = await User.findOne({ email: authorEmail }, 'blockedEmails');
+      if ((author?.blockedEmails || []).map((e) => e.toLowerCase()).includes(me)) {
+        return res.status(403).json({ error: 'You can’t comment on this post' });
+      }
+    }
+
+    const imageUrls = await Promise.all(files.map((file) => new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { resource_type: 'image', folder: 'majority-hair/comments', transformation: [{ quality: 'auto', fetch_format: 'auto' }] },
+        (error, result) => { if (error) reject(error); else resolve(result.secure_url); },
+      );
+      stream.end(file.buffer);
+    })));
+    item.comments.push({
+      author: req.user.email,
+      authorId: req.user._id,
+      authorDisplayName: req.user.displayName || '',
+      text,
+      imageUrls,
+      createdAt: new Date(),
+    });
+    await item.save();
+    res.status(201).json({ success: true, comment: item.comments[item.comments.length - 1] });
+  } catch (err) {
+    console.error('Comment submission failed:', err.message);
+    res.status(500).json({ error: 'Failed to post comment' });
+  }
+};
+app.post('/api/posts/:postId/comments', authMiddleware, parseCommentImages, createCommentHandler);
+app.post('/api/duma/:postId/comments', authMiddleware, parseCommentImages, createCommentHandler);
+
+// GET /api/posts/:postId/comments — visible comments (hides removed ones and ones from people you blocked)
+app.get('/api/posts/:postId/comments', async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.postId)) return res.status(404).json({ error: 'Post not found' });
+    const item = await DumaItem.findById(req.params.postId, 'comments hiddenByModeration');
+    if (!item || item.hiddenByModeration) return res.status(404).json({ error: 'Post not found' });
+    const blocked = await getViewerBlocked(req);
+    res.json({
+      comments: item.comments.filter((c) => !c.hiddenByModeration && !blocked.has(String(c.author || '').toLowerCase())),
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not load comments' });
+  }
+});
+
+// DELETE /api/posts/:postId/comments/:commentId — the comment's author or the post's author
+app.delete('/api/posts/:postId/comments/:commentId', authMiddleware, async (req, res) => {
+  try {
+    const { postId, commentId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(postId) || !mongoose.Types.ObjectId.isValid(commentId)) {
+      return res.status(404).json({ error: 'Comment not found' });
+    }
+    const item = await DumaItem.findById(postId);
+    const comment = item?.comments.id(commentId);
+    if (!comment) return res.status(404).json({ error: 'Comment not found' });
+    const me = req.user.email.toLowerCase();
+    if (String(comment.author || '').toLowerCase() !== me && String(item.submittedBy || '').toLowerCase() !== me) {
+      return res.status(403).json({ error: 'Unauthorized to delete this comment' });
+    }
+    comment.deleteOne();
+    await item.save();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not delete comment' });
   }
 });
 
@@ -1682,6 +1831,8 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
 app.put('/api/profile', authMiddleware, async (req, res) => {
   try {
     const { perspective, socialLinks, avatarUrl, avatar, systemSettings, displayName, location, avatarSlots } = req.body;
+    if (rejectIfObjectionable(res, displayName, location,
+      ...(perspective ? Object.values(perspective).map((b) => b && b.content) : []))) return;
     const hadAvatarBefore = !!req.user.avatarUrl;
     const updateData = {};
     
@@ -2137,6 +2288,7 @@ app.post('/api/messages', authMiddleware, async (req, res) => {
   try {
     const trimmed = String(req.body?.text || '').trim();
     if (!trimmed) return res.status(400).json({ error: 'text is required' });
+    if (rejectIfObjectionable(res, trimmed)) return;
 
     const other = await resolveThreadUser(req.body?.toUserId);
     if (!other) return res.status(404).json({ error: 'Recipient not found' });
@@ -2582,6 +2734,7 @@ app.post('/api/auth/apple/mobile', async (req, res) => {
         rank_score: 1,
       });
     }
+    if (user.banned) return res.status(403).json({ error: BANNED_MESSAGE, banned: true });
 
     const token = generateToken(user._id, true);
     res.json({
@@ -2707,6 +2860,20 @@ app.post('/api/report', authMiddleware, async (req, res) => {
       reason: String(reason).slice(0, 200),
       details: String(details || '').slice(0, 2000),
     });
+
+    // Hide a comment automatically once several different people report it (contentId = comment id)
+    if (contentType === 'comment' && mongoose.isValidObjectId(contentId)) {
+      const reporters = await Report.distinct('reporterId', { contentType: 'comment', contentId: String(contentId) });
+      await DumaItem.updateOne(
+        { 'comments._id': contentId },
+        {
+          $set: {
+            'comments.$.reportCount': reporters.length,
+            ...(reporters.length >= REPORT_AUTOHIDE_THRESHOLD ? { 'comments.$.hiddenByModeration': true } : {}),
+          },
+        },
+      );
+    }
 
     // Hide Duma posts automatically once several different people report them
     if (contentType === 'duma' && mongoose.isValidObjectId(contentId)) {
@@ -2842,19 +3009,100 @@ app.get('/api/admin/partner-applications', authMiddleware, requireAdmin, async (
   }
 });
 
-// POST /api/admin/reports/:id/resolve  { action }
+// Remove one reported item (post, comment or message)
+const removeReportedContent = async (report) => {
+  const id = String(report.contentId || '');
+  if (!mongoose.isValidObjectId(id)) return;
+  if (report.contentType === 'duma') {
+    await DumaItem.updateOne({ _id: id }, { $set: { hiddenByModeration: true } });
+  } else if (report.contentType === 'comment') {
+    await DumaItem.updateOne({ 'comments._id': id }, { $set: { 'comments.$.hiddenByModeration': true } });
+  } else if (report.contentType === 'message') {
+    await Message.deleteOne({ _id: id });
+  }
+};
+
+// Eject a user: ban the account and remove everything they posted
+const banUserByEmail = async (email, reason) => {
+  const target = String(email || '').trim().toLowerCase();
+  if (!target) return null;
+  const user = await User.findOne({ email: target });
+  await Promise.all([
+    user && User.updateOne({ _id: user._id }, { $set: { banned: true, bannedAt: new Date(), banReason: String(reason || 'Community Guidelines violation').slice(0, 200) } }),
+    DumaItem.updateMany({ submittedBy: target }, { $set: { hiddenByModeration: true } }),
+    DumaItem.updateMany({ 'comments.author': target }, { $set: { 'comments.$[c].hiddenByModeration': true } }, { arrayFilters: [{ 'c.author': target }] }),
+    user && Message.deleteMany({ senderId: user._id }),
+    Report.updateMany({ reportedUser: target, status: 'open' }, { $set: { status: 'resolved', resolvedAt: new Date(), action: 'user_banned' } }),
+  ].filter(Boolean));
+  console.log(`⛔ User ejected: ${target}`);
+  return user;
+};
+
+// POST /api/admin/reports/:id/resolve  { action: 'dismiss' | 'remove_content' | 'ban_user' | 'remove_and_ban' }
 app.post('/api/admin/reports/:id/resolve', authMiddleware, requireAdmin, async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: 'Invalid id' });
   try {
-    await Report.updateOne(
-      { _id: req.params.id },
-      { $set: { status: 'resolved', resolvedAt: new Date(), action: String(req.body?.action || 'reviewed').slice(0, 100) } },
-    );
-    res.json({ success: true });
+    const report = await Report.findById(req.params.id);
+    if (!report) return res.status(404).json({ error: 'Report not found' });
+    const action = String(req.body?.action || 'reviewed').slice(0, 100);
+    if (action === 'remove_content' || action === 'remove_and_ban') await removeReportedContent(report);
+    if ((action === 'ban_user' || action === 'remove_and_ban') && report.reportedUser) {
+      await banUserByEmail(report.reportedUser, `Report ${report._id}: ${report.reason}`);
+    }
+    await Report.updateOne({ _id: report._id }, { $set: { status: 'resolved', resolvedAt: new Date(), action } });
+    res.json({ success: true, action });
   } catch (err) {
+    console.error('Resolve report error:', err);
     res.status(500).json({ error: 'Could not resolve report' });
   }
 });
+
+// POST /api/admin/users/ban  { email, reason }   |   POST /api/admin/users/unban  { email }
+app.post('/api/admin/users/ban', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'email is required' });
+    if (email === req.user.email.toLowerCase()) return res.status(400).json({ error: 'You cannot ban yourself' });
+    await banUserByEmail(email, req.body?.reason);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not ban user' });
+  }
+});
+app.post('/api/admin/users/unban', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    await User.updateOne({ email }, { $set: { banned: false }, $unset: { bannedAt: 1, banReason: 1 } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not unban user' });
+  }
+});
+
+// GET /api/admin/users/banned
+app.get('/api/admin/users/banned', authMiddleware, requireAdmin, async (req, res) => {
+  const users = await User.find({ banned: true }, 'email displayName bannedAt banReason').sort({ bannedAt: -1 }).limit(500);
+  res.json(users);
+});
+
+// 24-hour SLA: every hour, email moderators about open reports older than 20 hours
+const REPORT_SLA_REMINDER_MS = 60 * 60 * 1000;
+setInterval(async () => {
+  try {
+    if (!MODERATION_EMAILS.length || mongoose.connection.readyState !== 1) return;
+    const overdue = await Report.find({ status: 'open', createdAt: { $lt: new Date(Date.now() - 20 * 3600000) } }).limit(50);
+    if (!overdue.length) return;
+    await sendEmail(
+      MODERATION_EMAILS.join(','),
+      `[Moderation] ${overdue.length} report(s) near the 24-hour deadline`,
+      `<p>These reports must be actioned within 24 hours (remove the content and ban the user if it breaks the rules):</p><ul>${
+        overdue.map((r) => `<li>${escapeHtml(r.contentType)} ${escapeHtml(r.contentId)} — ${escapeHtml(r.reason)} — reported user ${escapeHtml(r.reportedUser || '—')} — ${escapeHtml(r.createdAt.toISOString())}</li>`).join('')
+      }</ul><p>Review them at https://themajorities.com/admin/moderation</p>`,
+    );
+  } catch (e) {
+    console.error('Report SLA reminder failed:', e.message);
+  }
+}, REPORT_SLA_REMINDER_MS).unref();
 
 // POST /api/admin/duma/:id/hide  |  /api/admin/duma/:id/unhide
 const setDumaHidden = (hidden) => async (req, res) => {
