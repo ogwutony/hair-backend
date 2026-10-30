@@ -1304,6 +1304,7 @@ app.get('/api/duma', async (req, res) => {
 
 // 2. Voting Logic - Accept both "voteType" and "vote" parameters
 // The website and app send yes / no / abstain; older clients send yay / nay. Stored as yay / nay / abstain.
+const YES_VOTE_RECEIVED_POINTS = 10;
 const VOTE_ALIASES = { yes: 'yay', yay: 'yay', no: 'nay', nay: 'nay', abstain: 'abstain' };
 const VOTE_LABELS = { yay: 'yes', nay: 'no', abstain: 'abstain' };
 // Counts under both names, so any client version reads them correctly
@@ -1362,6 +1363,18 @@ app.post('/api/duma/:id/vote', authMiddleware, async (req, res) => {
 
     // Award points for voting
     await updateRankScore(req.user._id, 2);
+
+    // Post author earns +10 for every "yes" their post receives (no self-vote points)
+    if (voteType === 'yay') {
+      let authorId = item.submitterId;
+      if (!authorId && item.submittedBy) {
+        const author = await User.findOne({ email: item.submittedBy }).select('_id').lean();
+        authorId = author && author._id;
+      }
+      if (authorId && String(authorId) !== String(req.user._id)) {
+        await updateRankScore(authorId, YES_VOTE_RECEIVED_POINTS);
+      }
+    }
 
     res.json({ success: true, yourVote: VOTE_LABELS[voteType], votes: voteCounts(item.votes) });
   } catch (err) {
