@@ -169,6 +169,12 @@ app.post('/api/webhooks/shopify/orders-create', express.raw({ type: 'application
       return res.status(200).json({ received: true, skipped: 'user_not_found' });
     }
 
+    // Link the Shopify customer who placed the order to the website account with the same email
+    const orderCustomerId = order.customer && order.customer.admin_graphql_api_id;
+    if (orderCustomerId && user.shopifyCustomerId !== orderCustomerId) {
+      await User.updateOne({ _id: user._id }, { $set: { shopifyCustomerId: orderCustomerId } });
+    }
+
     // Validate total_price before processing
     const parsedPrice = parseFloat(order.total_price);
     if (isNaN(parsedPrice) || parsedPrice < 0) {
@@ -310,6 +316,7 @@ const {
 const { findNearestPlace, parseCoordinate, isPlacesConfigured } = require('./lib/places');
 const { validatePartnerApplication, publicPartnerSummary, toPublicDumaItem } = require('./lib/partners');
 const { fetchWholesaleProducts } = require('./lib/wholesale');
+const { linkUserToShopify, isShopifyCustomerSyncConfigured } = require('./lib/shopifyCustomers');
 const { rejectIfObjectionable } = require('./lib/contentFilter');
 
 // Premium Partner threshold — 900,000 points ("Supreme Lizard King"), matching the web and mobile apps
@@ -399,6 +406,7 @@ const userSchema = new mongoose.Schema({
   email:            { type: String, required: true, unique: true },
   password:         { type: String },
   googleId:         { type: String },
+  shopifyCustomerId: { type: String, default: null }, // Shopify customer GID, matched by email
   resetToken:       { type: String },
   resetTokenExpiry: { type: Date },
   rank_score:       { type: Number, default: 1 },   // BigInt-scale (up to 10,000,000)
@@ -1046,6 +1054,7 @@ app.post('/api/auth/google', async (req, res) => {
       await user.save();
     }
 
+    linkUserToShopify(user);
     const token = generateToken(user._id, true);
 
     const cookieOptions = {
@@ -1096,6 +1105,7 @@ app.post('/api/signup', async (req, res) => {
       // The sign-up form requires agreeing to the Terms of Use / EULA before the account is created
       ...(req.body?.termsAccepted ? { termsAcceptedAt: new Date(), termsVersion: String(req.body?.termsVersion || '').slice(0, 40) || null } : {}),
     });
+    linkUserToShopify(user);
     const token = generateToken(user._id, false);
 
     const cookieOptions = {
@@ -1126,6 +1136,7 @@ app.post('/api/login', async (req, res) => {
     if (!match) return res.status(401).json({ error: 'Invalid credentials' });
     if (user.banned) return res.status(403).json({ error: BANNED_MESSAGE, banned: true });
 
+    linkUserToShopify(user);
     const token = generateToken(user._id, !!rememberMe);
     const cookieOptions = {
       httpOnly: true,
@@ -2749,6 +2760,7 @@ app.post('/api/auth/apple/mobile', async (req, res) => {
     }
     if (user.banned) return res.status(403).json({ error: BANNED_MESSAGE, banned: true });
 
+    linkUserToShopify(user);
     const token = generateToken(user._id, true);
     res.json({
       email: user.email,
@@ -3127,6 +3139,29 @@ const setDumaHidden = (hidden) => async (req, res) => {
     res.status(500).json({ error: 'Could not update post' });
   }
 };
+// POST /api/admin/shopify/sync-customers — create/link Shopify customers for website users not yet linked.
+// Processes up to `limit` users per call (default 200); call again until `remaining` is 0.
+app.post('/api/admin/shopify/sync-customers', authMiddleware, requireAdmin, async (req, res) => {
+  if (!isShopifyCustomerSyncConfigured()) {
+    return res.status(500).json({ error: 'SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET are not configured on the server.' });
+  }
+  try {
+    const limit = Math.min(Math.max(parseInt(req.body?.limit, 10) || 200, 1), 500);
+    // Apple placeholder addresses never go to Shopify, so they are left out
+    const unlinked = { shopifyCustomerId: { $in: [null, ''] }, banned: { $ne: true }, email: { $not: /@users\.themajorities\.com$/i } };
+    const users = await User.find(unlinked).limit(limit);
+    let linked = 0;
+    for (const user of users) {
+      if (await linkUserToShopify(user)) linked += 1;
+    }
+    const remaining = await User.countDocuments(unlinked);
+    res.json({ processed: users.length, linked, failed: users.length - linked, remaining });
+  } catch (err) {
+    console.error('Shopify customer backfill error:', err.message);
+    res.status(500).json({ error: 'Shopify customer sync failed' });
+  }
+});
+
 app.post('/api/admin/duma/:id/hide', authMiddleware, requireAdmin, setDumaHidden(true));
 app.post('/api/admin/duma/:id/unhide', authMiddleware, requireAdmin, setDumaHidden(false));
 
