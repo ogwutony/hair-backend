@@ -3143,7 +3143,7 @@ const setDumaHidden = (hidden) => async (req, res) => {
 // Processes up to `limit` users per call (default 200); call again until `remaining` is 0.
 app.post('/api/admin/shopify/sync-customers', authMiddleware, requireAdmin, async (req, res) => {
   if (!isShopifyCustomerSyncConfigured()) {
-    return res.status(500).json({ error: 'SHOPIFY_ADMIN_TOKEN is not configured on the server.' });
+    return res.status(500).json({ error: 'SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET are not configured on the server.' });
   }
   try {
     const limit = Math.min(Math.max(parseInt(req.body?.limit, 10) || 200, 1), 500);
