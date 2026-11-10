@@ -636,6 +636,26 @@ reportSchema.index({ status: 1, createdAt: -1 });
 reportSchema.index({ contentType: 1, contentId: 1 });
 const Report = mongoose.model('Report', reportSchema);
 
+// Duma Marketplace listings. Buyers check out through the seller's external link, never on-platform.
+const marketplaceListingSchema = new mongoose.Schema({
+  title:          { type: String, required: true },
+  description:    { type: String, required: true },
+  imageUrl:       { type: String, default: null },
+  price:          { type: Number, required: true, min: 0 },
+  category:       { type: String, required: true },
+  externalLink:   { type: String, required: true },
+  userId:         { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  submittedBy:    String,
+  submitterDisplayName: String,
+  submitterRank:  String,
+  boostedUntil:   { type: Date, default: null },
+  reportCount:    { type: Number, default: 0 },
+  hiddenByModeration: { type: Boolean, default: false },
+  createdAt:      { type: Date, default: Date.now }
+});
+marketplaceListingSchema.index({ boostedUntil: -1, createdAt: -1 });
+const MarketplaceListing = mongoose.model('MarketplaceListing', marketplaceListingSchema);
+
 // --- HELPERS ---
 const JWT_SECRET = process.env.JWT_SECRET || 'majority-hair-default-secret-change-me';
 
@@ -1735,6 +1755,144 @@ const createCommentHandler = async (req, res) => {
 };
 app.post('/api/posts/:postId/comments', authMiddleware, parseCommentImages, createCommentHandler);
 app.post('/api/duma/:postId/comments', authMiddleware, parseCommentImages, createCommentHandler);
+
+// ========== MARKETPLACE ==========
+// Used by the web Duma (Economics › Marketplace) and the Sell page.
+const MARKETPLACE_BOOST_COST_POINTS = 500;
+const MARKETPLACE_BOOST_DURATION_MS = 24 * 60 * 60 * 1000;
+const MARKETPLACE_LISTING_POINTS = 50;
+
+const marketplaceImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5242880, files: 1 },
+  fileFilter: (req, file, cb) => {
+    if (/^image\/(jpe?g|png|webp|heic|heif)$/i.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Only JPEG, PNG, WebP or HEIC images are allowed'));
+  },
+});
+const parseMarketplaceImage = (req, res, next) => {
+  marketplaceImageUpload.single('image')(req, res, (error) => {
+    if (!error) return next();
+    const message = error.code === 'LIMIT_FILE_SIZE' ? 'Image must be 5 MB or smaller' : error.message || 'Invalid image';
+    return res.status(400).json({ error: message });
+  });
+};
+
+// GET /api/marketplace — active boosts first (latest boost first), then newest
+app.get('/api/marketplace', async (req, res) => {
+  try {
+    const now = new Date();
+    const items = await MarketplaceListing.aggregate([
+      { $match: { hiddenByModeration: { $ne: true } } },
+      { $addFields: { boostPriority: { $cond: [{ $gt: ['$boostedUntil', now] }, 1, 0] } } },
+      { $sort: { boostPriority: -1, boostedUntil: -1, createdAt: -1 } },
+      { $project: { boostPriority: 0, userId: 0, reportCount: 0, hiddenByModeration: 0 } },
+      { $limit: 500 },
+    ]);
+    res.json(items);
+  } catch (err) {
+    console.error('Marketplace feed failed:', err.message);
+    res.status(500).json({ error: 'Failed to fetch marketplace listings' });
+  }
+});
+
+// POST /api/marketplace/list (multipart: title, description, price, category, externalLink, image?)
+app.post('/api/marketplace/list', authMiddleware, parseMarketplaceImage, async (req, res) => {
+  try {
+    const field = (name, max) => (typeof req.body?.[name] === 'string' ? req.body[name].trim().slice(0, max) : '');
+    const title = field('title', 200);
+    const description = field('description', 5000);
+    const category = field('category', 100);
+    const externalLink = field('externalLink', 2000);
+    const rawPrice = req.body?.price;
+    const price = Number(rawPrice);
+
+    if (!title || !description || !category || !externalLink || rawPrice === undefined || rawPrice === '') {
+      return res.status(400).json({ error: 'Title, description, price, category, and external link are required' });
+    }
+    if (!Number.isFinite(price) || price < 0) {
+      return res.status(400).json({ error: 'Price must be a valid non-negative number' });
+    }
+    try {
+      const parsed = new URL(externalLink);
+      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('bad protocol');
+    } catch {
+      return res.status(400).json({ error: 'External link must be a valid http(s) URL' });
+    }
+    if (rejectIfObjectionable(res, title, description, category)) return;
+
+    let imageUrl = null;
+    if (req.file) {
+      try {
+        imageUrl = await new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            { resource_type: 'image', folder: 'majority-hair/marketplace', transformation: [{ quality: 'auto', fetch_format: 'auto' }] },
+            (error, result) => { if (error) reject(error); else resolve(result.secure_url); },
+          );
+          stream.end(req.file.buffer);
+        });
+      } catch (uploadErr) {
+        console.error('Marketplace image upload failed:', uploadErr.message);
+        return res.status(502).json({ error: 'Image upload failed. Please try again.' });
+      }
+    }
+
+    const item = await MarketplaceListing.create({
+      title,
+      description,
+      imageUrl,
+      price: Math.round(price * 100) / 100,
+      category,
+      externalLink,
+      userId: req.user._id,
+      submittedBy: req.user.email,
+      submitterDisplayName: req.user.displayName || '',
+      submitterRank: getRankTitle(req.user.rank_score || 1),
+    });
+
+    await updateRankScore(req.user._id, MARKETPLACE_LISTING_POINTS);
+    res.status(201).json({ success: true, item });
+  } catch (err) {
+    console.error('Marketplace listing failed:', err.message);
+    res.status(500).json({ error: 'Failed to create listing' });
+  }
+});
+
+// POST /api/marketplace/boost { listingId } — pin your own listing for 24 hours for 500 points
+app.post('/api/marketplace/boost', authMiddleware, async (req, res) => {
+  try {
+    const listingId = req.body?.listingId || req.body?.id;
+    if (!listingId || !mongoose.isValidObjectId(listingId)) {
+      return res.status(400).json({ error: 'A valid listingId is required' });
+    }
+    const listing = await MarketplaceListing.findById(listingId);
+    if (!listing || listing.hiddenByModeration) return res.status(404).json({ error: 'Listing not found' });
+    if (String(listing.userId) !== String(req.user._id)) {
+      return res.status(403).json({ error: 'You can only boost your own listings' });
+    }
+    if (listing.boostedUntil && listing.boostedUntil > new Date()) {
+      return res.status(409).json({ error: 'This listing is already boosted', boostedUntil: listing.boostedUntil });
+    }
+
+    // Deduct atomically; fails when the balance is too low
+    const debitedUser = await User.findOneAndUpdate(
+      { _id: req.user._id, rank_score: { $gte: MARKETPLACE_BOOST_COST_POINTS } },
+      { $inc: { rank_score: -MARKETPLACE_BOOST_COST_POINTS } },
+      { new: true },
+    );
+    if (!debitedUser) {
+      return res.status(402).json({ error: `Insufficient points. Boosting costs ${MARKETPLACE_BOOST_COST_POINTS} points.`, balance: req.user.rank_score || 1 });
+    }
+    await User.updateOne({ _id: req.user._id }, { $set: { rank_title: getRankTitle(debitedUser.rank_score) } });
+
+    listing.boostedUntil = new Date(Date.now() + MARKETPLACE_BOOST_DURATION_MS);
+    await listing.save();
+    res.json({ success: true, boostedUntil: listing.boostedUntil, balance: debitedUser.rank_score, item: listing });
+  } catch (err) {
+    console.error('Marketplace boost failed:', err.message);
+    res.status(500).json({ error: 'Failed to boost listing' });
+  }
+});
 
 // GET /api/posts/:postId/comments — visible comments (hides removed ones and ones from people you blocked)
 app.get('/api/posts/:postId/comments', async (req, res) => {
@@ -2883,6 +3041,20 @@ app.post('/api/report', authMiddleware, async (req, res) => {
           $set: {
             'comments.$.reportCount': reporters.length,
             ...(reporters.length >= REPORT_AUTOHIDE_THRESHOLD ? { 'comments.$.hiddenByModeration': true } : {}),
+          },
+        },
+      );
+    }
+
+    // Hide marketplace listings automatically once several different people report them
+    if (contentType === 'marketplace' && mongoose.isValidObjectId(contentId)) {
+      const reporters = await Report.distinct('reporterId', { contentType: 'marketplace', contentId: String(contentId) });
+      await MarketplaceListing.updateOne(
+        { _id: contentId },
+        {
+          $set: {
+            reportCount: reporters.length,
+            ...(reporters.length >= REPORT_AUTOHIDE_THRESHOLD ? { hiddenByModeration: true } : {}),
           },
         },
       );
