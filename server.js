@@ -214,6 +214,7 @@ app.use(cookieParser());
 // CORS Configuration - Allows multiple origins
 const allowedOrigins = [
     'https://themajorities.com',
+    'https://community.themajorities.com',
     'https://www.themajorities.com',
     'https://majorityhairsolutions.com',
     'https://www.majorityhairsolutions.com',
