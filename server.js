@@ -1135,6 +1135,9 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
+// Shopify login remains disabled until callback/origin registration is complete.
+require('./lib/shopifyAuth').registerShopifyAuth(app, { User, generateToken, getRankTitle });
+
 // LOG IN
 app.post('/api/login', async (req, res) => {
   try {
