@@ -895,32 +895,9 @@ const maskEmail = (email) => {
   if (at < 1) return '';
   return `${e[0]}***${e.slice(at)}`;
 };
-// Owner sees their own address (clients compare it to decide whether to show edit/delete); everyone else gets ''.
-const hideEmail = (value, viewerEmail) =>
-  (viewerEmail && String(value || '').toLowerCase() === viewerEmail) ? value : '';
-// Optional auth: returns the viewer's email (lower-case) or ''.
-const getViewerEmail = async (req) => {
-  try {
-    let token = req.cookies?.token;
-    const authHeader = req.headers.authorization;
-    if (!token && authHeader?.startsWith('Bearer ')) token = authHeader.split(' ')[1];
-    if (!token) return '';
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const viewer = await User.findById(decoded.userId, 'email');
-    return String(viewer?.email || '').toLowerCase();
-  } catch { return ''; }
-};
-const scrubDumaItemForPublic = (item, viewerEmail) => {
-  const mine = viewerEmail && String(item.submittedBy || '').toLowerCase() === viewerEmail;
-  item.isOwner = Boolean(mine);
-  item.submittedBy = mine ? item.submittedBy : '';
-  item.comments = (item.comments || []).map((c) => ({
-    ...c,
-    isOwner: Boolean(viewerEmail && String(c.author || '').toLowerCase() === viewerEmail),
-    author: hideEmail(c.author, viewerEmail),
-  }));
-  return item;
-};
+// NOTE: /api/duma still returns submittedBy/comment authors as emails because the web and mobile apps
+// use email as the member identifier (messaging, follow, block, profile links). Hiding it needs a
+// coordinated move to user IDs in all clients first.
 
 // --- ROUTES ---
 
@@ -1382,9 +1359,6 @@ app.get('/api/duma', async (req, res) => {
         !c.hiddenByModeration && !viewerBlocked.has(String(c.author || '').toLowerCase()));
     }
 
-    const viewerEmail = await getViewerEmail(req);
-    const scrub = (list) => list.map((it) => scrubDumaItemForPublic(it, viewerEmail));
-
     // De-duplicate by submittedBy email — keep only the most recent item per user
     if (deduplicate === 'true') {
       const seen = new Set();
@@ -1397,10 +1371,10 @@ app.get('/api/duma', async (req, res) => {
         }
         // Items without a submitter are excluded from the deduplicated community grid
       }
-      return res.json(scrub(deduped));
+      return res.json(deduped);
     }
 
-    res.json(scrub(enriched));
+    res.json(enriched);
   } catch (err) {
     console.error('Request failed:', err.message);
     res.status(500).json({ error: 'Something went wrong. Please try again.' });
