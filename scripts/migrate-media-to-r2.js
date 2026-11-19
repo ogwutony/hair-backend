@@ -19,7 +19,9 @@ const { CLOUDINARY_URL, parseCloudinaryUrl, contentTypeFor } = require('../lib/m
 const arg = (name) => { const i = process.argv.indexOf(`--${name}`); return i > -1 ? process.argv[i + 1] : undefined; };
 const APPLY = process.argv.includes('--apply');
 const BACKUP = path.resolve(arg('backup') || './media-backup');
-const BASE = (arg('public-base') || '').replace(/\/+$/, '');
+const BASE = (arg('public-base') || process.env.R2_PUBLIC_URL || '').replace(/\/+$/, '');
+const ENDPOINT = process.env.R2_ENDPOINT || (process.env.R2_ACCOUNT_ID ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com` : '');
+const BUCKET = process.env.R2_BUCKET_NAME || process.env.R2_BUCKET;
 
 // Replace every Cloudinary link inside a document with its R2 address (only for files we actually backed up).
 const rewrite = (value, have, base, stats) => {
@@ -39,26 +41,28 @@ const rewrite = (value, have, base, stats) => {
 };
 
 (async () => {
-  for (const v of ['MONGODB_URI', 'R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET']) if (!process.env[v]) throw new Error(`${v} is not set`);
-  if (!BASE) throw new Error('--public-base is required (the public address of your R2 bucket)');
+  for (const v of ['MONGODB_URI', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY']) if (!process.env[v]) throw new Error(`${v} is not set`);
+  if (!ENDPOINT) throw new Error('R2_ENDPOINT (or R2_ACCOUNT_ID) is not set');
+  if (!BUCKET) throw new Error('R2_BUCKET_NAME (or R2_BUCKET) is not set');
+  if (!BASE) throw new Error('--public-base (or R2_PUBLIC_URL) is required: the public address of your R2 bucket');
   const manifest = JSON.parse(fs.readFileSync(path.join(BACKUP, 'manifest.json'), 'utf8'));
   const files = manifest.files.filter((f) => f.status !== 'FAILED' && fs.existsSync(path.join(BACKUP, f.key)));
   const have = new Set(files.map((f) => f.key));
-  console.log(`${APPLY ? 'APPLY' : 'Dry run'}: ${files.length} backed-up files → bucket "${process.env.R2_BUCKET}", links → ${BASE}/…`);
+  console.log(`${APPLY ? 'APPLY' : 'Dry run'}: ${files.length} backed-up files → bucket "${BUCKET}", links → ${BASE}/…`);
 
   const s3 = new S3Client({
     region: 'auto',
-    endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    endpoint: ENDPOINT,
     credentials: { accessKeyId: process.env.R2_ACCESS_KEY_ID, secretAccessKey: process.env.R2_SECRET_ACCESS_KEY },
   });
 
   if (APPLY) {
     let n = 0;
     for (const f of files) {
-      const exists = await s3.send(new HeadObjectCommand({ Bucket: process.env.R2_BUCKET, Key: f.key })).then(() => true).catch(() => false);
+      const exists = await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: f.key })).then(() => true).catch(() => false);
       if (!exists) {
         await s3.send(new PutObjectCommand({
-          Bucket: process.env.R2_BUCKET, Key: f.key, Body: fs.readFileSync(path.join(BACKUP, f.key)),
+          Bucket: BUCKET, Key: f.key, Body: fs.readFileSync(path.join(BACKUP, f.key)),
           ContentType: contentTypeFor(f.key), CacheControl: 'public, max-age=31536000, immutable',
         }));
       }

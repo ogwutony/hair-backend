@@ -13,6 +13,7 @@ const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
 const { sendUploadError, checkMediaStorage } = require('./lib/mediaStorage');
+const { createStorage } = require('./lib/storage');
 require('dotenv').config();
 
 // Cloudinary Configurationh
@@ -22,11 +23,11 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// Upload a buffer to Cloudinary using a stream
-const uploadToCloudinary = (buffer) => {
+// Cloudinary upload (used when STORAGE_PROVIDER is not r2)
+const cloudinaryUpload = (buffer, { folder = 'user_media' } = {}) => {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
-      { folder: 'user_media', resource_type: 'auto' },
+      { folder, resource_type: 'auto' },
       (error, result) => {
         if (error) reject(error);
         else resolve(result);
@@ -35,6 +36,12 @@ const uploadToCloudinary = (buffer) => {
     Readable.from(buffer).pipe(stream);
   });
 };
+
+// Where uploads go: Cloudflare R2 when STORAGE_PROVIDER=r2 and configured, otherwise Cloudinary
+const storage = createStorage({ cloudinaryUpload });
+console.log(`📦 Media storage provider: ${storage.provider}`);
+// Same call shape as before: resolves { secure_url }
+const uploadToCloudinary = (buffer, { mimetype, folder } = {}) => storage.upload(buffer, { mimetype, folder: folder || 'user_media' });
 
 // Validate critical environment variables
 if (!process.env.STRIPE_SECRET_KEY) {
@@ -926,8 +933,8 @@ app.get('/api/health', (req, res) => {
 // GET /api/health/media — is Cloudinary (photo/video storage) accepting uploads?
 // 200 when it is, 503 with the reason when the account is disabled, over its limits or not configured.
 app.get('/api/health/media', async (req, res) => {
-  const media = await checkMediaStorage(cloudinary);
-  res.status(media.ok ? 200 : 503).json(media);
+  const media = storage.provider === 'r2' ? await storage.health() : await checkMediaStorage(cloudinary);
+  res.status(media.ok ? 200 : 503).json({ ...media, checkedAt: new Date().toISOString() });
 });
 
 // --- MongoDB Models API Endpoints ---
@@ -1547,7 +1554,7 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
     let media = [];
     try {
       media = await Promise.all((req.files || []).map(async (file) => {
-        const result = await uploadToCloudinary(file.buffer);
+        const result = await uploadToCloudinary(file.buffer, { mimetype: file.mimetype });
         return { field: file.fieldname, url: result.secure_url, type: file.mimetype.startsWith('video') ? 'video' : 'image' };
       }));
     } catch (uploadErr) {
@@ -1815,13 +1822,18 @@ const createCommentHandler = async (req, res) => {
 
     let imageUrls;
     try {
-      imageUrls = await Promise.all(files.map((file) => new Promise((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          { resource_type: 'image', folder: 'majority-hair/comments', transformation: [{ quality: 'auto', fetch_format: 'auto' }] },
-          (error, result) => { if (error) reject(error); else resolve(result.secure_url); },
-        );
-        stream.end(file.buffer);
-      })));
+      imageUrls = await Promise.all(files.map(async (file) => {
+        const result = storage.provider === 'r2'
+          ? await storage.upload(file.buffer, { mimetype: file.mimetype, folder: 'majority-hair/comments' })
+          : await new Promise((resolve, reject) => {
+              const stream = cloudinary.uploader.upload_stream(
+                { resource_type: 'image', folder: 'majority-hair/comments', transformation: [{ quality: 'auto', fetch_format: 'auto' }] },
+                (error, r) => { if (error) reject(error); else resolve(r); },
+              );
+              stream.end(file.buffer);
+            });
+        return result.secure_url;
+      }));
     } catch (uploadErr) {
       return sendUploadError(res, uploadErr, 'Comment image upload');
     }
@@ -1911,13 +1923,15 @@ app.post('/api/marketplace/list', authMiddleware, parseMarketplaceImage, async (
     let imageUrl = null;
     if (req.file) {
       try {
-        imageUrl = await new Promise((resolve, reject) => {
-          const stream = cloudinary.uploader.upload_stream(
-            { resource_type: 'image', folder: 'majority-hair/marketplace', transformation: [{ quality: 'auto', fetch_format: 'auto' }] },
-            (error, result) => { if (error) reject(error); else resolve(result.secure_url); },
-          );
-          stream.end(req.file.buffer);
-        });
+        imageUrl = storage.provider === 'r2'
+          ? (await storage.upload(req.file.buffer, { mimetype: req.file.mimetype, folder: 'majority-hair/marketplace' })).secure_url
+          : await new Promise((resolve, reject) => {
+              const stream = cloudinary.uploader.upload_stream(
+                { resource_type: 'image', folder: 'majority-hair/marketplace', transformation: [{ quality: 'auto', fetch_format: 'auto' }] },
+                (error, result) => { if (error) reject(error); else resolve(result.secure_url); },
+              );
+              stream.end(req.file.buffer);
+            });
       } catch (uploadErr) {
         return sendUploadError(res, uploadErr, 'Marketplace image upload');
       }
@@ -2228,7 +2242,7 @@ app.post('/api/users/upload-avatar', authMiddleware, (req, res, next) => {
 
     let cloudinaryResult;
     try {
-      cloudinaryResult = await uploadToCloudinary(req.file.buffer);
+      cloudinaryResult = await uploadToCloudinary(req.file.buffer, { mimetype: req.file.mimetype, folder: 'majority-hair/avatars' });
     } catch (uploadErr) {
       return sendUploadError(res, uploadErr, 'Avatar upload');
     }
@@ -2339,7 +2353,7 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
 
     let cloudinaryResult;
     try {
-      cloudinaryResult = await uploadToCloudinary(file.buffer);
+      cloudinaryResult = await uploadToCloudinary(file.buffer, { mimetype: file.mimetype });
     } catch (uploadErr) {
       return sendUploadError(res, uploadErr, 'Media upload');
     }
@@ -2377,6 +2391,9 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
 
 // GET /api/media/presigned-url — generate a Cloudinary signed upload token for direct client upload
 app.get('/api/media/presigned-url', authMiddleware, (req, res) => {
+  if (storage.provider === 'r2') {
+    return res.status(501).json({ error: 'Direct uploads are not available. Upload through POST /api/media/upload instead.' });
+  }
   const { fileType, contentLength } = req.query;
 
   const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/webm', 'video/quicktime'];
