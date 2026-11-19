@@ -10,6 +10,7 @@ const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { Readable } = require('stream');
 const cookieParser = require('cookie-parser');
+const { sendUploadError, checkMediaStorage } = require('./lib/mediaStorage');
 require('dotenv').config();
 
 // Cloudinary Configurationh
@@ -239,11 +240,10 @@ app.use(cors({
       return pattern instanceof RegExp ? pattern.test(origin) : pattern === origin;
     });
 
-    if (isAllowed) {
-      return callback(null, true);
-    } else {
-      return callback(new Error('Not allowed by CORS'), false);
-    }
+    if (isAllowed) return callback(null, true);
+    // Refuse quietly: no CORS headers, so the browser blocks it. Passing an Error here
+    // turned every request from an unknown origin into a 500 Internal Server Error.
+    return callback(null, false);
   },
   credentials: true, // Required if you are sending cookies or Authorization headers
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -877,7 +877,18 @@ app.get('/', (req, res) => res.send('The Majority Backend is Live!'));
 
 // API Health check endpoint
 app.get('/api/health', (req, res) => {
-  res.status(200).json({ status: 'ok', message: 'Backend is running' });
+  res.status(200).json({
+    status: 'ok',
+    message: 'Backend is running',
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+  });
+});
+
+// GET /api/health/media — is Cloudinary (photo/video storage) accepting uploads?
+// 200 when it is, 503 with the reason when the account is disabled, over its limits or not configured.
+app.get('/api/health/media', async (req, res) => {
+  const media = await checkMediaStorage(cloudinary);
+  res.status(media.ok ? 200 : 503).json(media);
 });
 
 // --- MongoDB Models API Endpoints ---
@@ -1485,8 +1496,7 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
         return { field: file.fieldname, url: result.secure_url, type: file.mimetype.startsWith('video') ? 'video' : 'image' };
       }));
     } catch (uploadErr) {
-      console.error('Partner media upload failed:', uploadErr.message);
-      return res.status(502).json({ error: 'Could not upload your photos or video. Please try again.' });
+      return sendUploadError(res, uploadErr, 'Partner media upload');
     }
 
     const item = await DumaItem.create({
@@ -1735,13 +1745,18 @@ const createCommentHandler = async (req, res) => {
       }
     }
 
-    const imageUrls = await Promise.all(files.map((file) => new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        { resource_type: 'image', folder: 'majority-hair/comments', transformation: [{ quality: 'auto', fetch_format: 'auto' }] },
-        (error, result) => { if (error) reject(error); else resolve(result.secure_url); },
-      );
-      stream.end(file.buffer);
-    })));
+    let imageUrls;
+    try {
+      imageUrls = await Promise.all(files.map((file) => new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { resource_type: 'image', folder: 'majority-hair/comments', transformation: [{ quality: 'auto', fetch_format: 'auto' }] },
+          (error, result) => { if (error) reject(error); else resolve(result.secure_url); },
+        );
+        stream.end(file.buffer);
+      })));
+    } catch (uploadErr) {
+      return sendUploadError(res, uploadErr, 'Comment image upload');
+    }
     item.comments.push({
       author: req.user.email,
       authorId: req.user._id,
@@ -1836,8 +1851,7 @@ app.post('/api/marketplace/list', authMiddleware, parseMarketplaceImage, async (
           stream.end(req.file.buffer);
         });
       } catch (uploadErr) {
-        console.error('Marketplace image upload failed:', uploadErr.message);
-        return res.status(502).json({ error: 'Image upload failed. Please try again.' });
+        return sendUploadError(res, uploadErr, 'Marketplace image upload');
       }
     }
 
@@ -2140,7 +2154,12 @@ app.post('/api/users/upload-avatar', authMiddleware, (req, res, next) => {
       return res.status(400).json({ error: 'No file provided' });
     }
 
-    const cloudinaryResult = await uploadToCloudinary(req.file.buffer);
+    let cloudinaryResult;
+    try {
+      cloudinaryResult = await uploadToCloudinary(req.file.buffer);
+    } catch (uploadErr) {
+      return sendUploadError(res, uploadErr, 'Avatar upload');
+    }
     const profilePictureUrl = cloudinaryResult.secure_url;
 
     await User.findByIdAndUpdate(req.user._id, { profilePictureUrl, avatarUrl: profilePictureUrl });
@@ -2244,7 +2263,12 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
       return res.status(400).json({ error: 'Video must be under 50MB' });
     }
 
-    const cloudinaryResult = await uploadToCloudinary(file.buffer);
+    let cloudinaryResult;
+    try {
+      cloudinaryResult = await uploadToCloudinary(file.buffer);
+    } catch (uploadErr) {
+      return sendUploadError(res, uploadErr, 'Media upload');
+    }
     const storageUrl = cloudinaryResult.secure_url;
 
     const media = await Media.create({
@@ -2273,7 +2297,7 @@ app.post('/api/media/upload', authMiddleware, upload.single('file'), async (req,
     });
   } catch (err) {
     console.error("Upload Error:", err);
-    res.status(500).json({ error: 'Cloudinary upload failed' });
+    res.status(500).json({ error: 'Your upload could not be saved. Please try again.' });
   }
 });
 
@@ -2327,7 +2351,9 @@ app.post('/api/media/confirm', authMiddleware, async (req, res) => {
     try {
       cloudinaryAsset = await cloudinary.api.resource(publicId, { resource_type: resourceType });
     } catch (e) {
-      return res.status(400).json({ error: 'Could not verify asset on Cloudinary' });
+      const httpCode = Number(e?.http_code || e?.error?.http_code) || 0;
+      if (httpCode === 404) return res.status(400).json({ error: 'Could not verify asset on Cloudinary' });
+      return sendUploadError(res, e, 'Media confirm');
     }
 
     const media = await Media.create({
