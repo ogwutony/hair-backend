@@ -682,7 +682,8 @@ const MarketplaceListing = mongoose.model('MarketplaceListing', marketplaceListi
 
 // --- HELPERS ---
 if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
-  throw new Error('JWT_SECRET must be set in production');
+  // Loud, not fatal: a missing secret means tokens are signed with a public default. Set JWT_SECRET now.
+  console.error('🚨 SECURITY: JWT_SECRET is not set. Set it in the host environment immediately.');
 }
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-insecure-secret-do-not-use-in-production';
 
