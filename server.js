@@ -10,6 +10,8 @@ const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { Readable } = require('stream');
 const cookieParser = require('cookie-parser');
+const helmet = require('helmet');
+const { rateLimit } = require('express-rate-limit');
 const { sendUploadError, checkMediaStorage } = require('./lib/mediaStorage');
 require('dotenv').config();
 
@@ -139,7 +141,9 @@ app.post('/api/webhooks/shopify/orders-create', express.raw({ type: 'application
     .update(req.body)
     .digest('base64');
 
-  if (generatedHmac !== hmacHeader) {
+  const hmacA = Buffer.from(generatedHmac);
+  const hmacB = Buffer.from(String(hmacHeader));
+  if (hmacA.length !== hmacB.length || !crypto.timingSafeEqual(hmacA, hmacB)) {
     console.error('⚠️ Shopify webhook HMAC verification failed');
     return res.status(401).json({ error: 'Shopify webhook HMAC verification failed' });
   }
@@ -183,19 +187,23 @@ app.post('/api/webhooks/shopify/orders-create', express.raw({ type: 'application
     const pointsToAward = Math.floor(totalCents * pointsPerDollar / 100);
 
     if (pointsToAward > 0) {
-      await updateRankScore(user._id, pointsToAward);
-      // Record the processed order for idempotency — the unique index on orderId prevents
-      // duplicate awards even under concurrent webhook deliveries (duplicate key error = already processed)
+      // Record the order FIRST. The unique index on orderId makes this the idempotency gate:
+      // a duplicate or concurrent delivery hits a duplicate-key error and awards nothing.
       try {
         await ShopifyWebhookEvent.create({ orderId: String(order.id), email, pointsAwarded: pointsToAward });
       } catch (dupErr) {
         if (dupErr.code === 11000) {
-          // Another concurrent delivery already processed this order; points were already awarded above.
-          // This is safe because updateRankScore applies an additive delta; log and move on.
-          console.warn(`⚠️ Shopify webhook: duplicate delivery detected for order ${order.id}, ignoring`);
-        } else {
-          throw dupErr;
+          console.warn(`⚠️ Shopify webhook: duplicate delivery for order ${order.id}, ignoring`);
+          return res.status(200).json({ received: true, skipped: 'already_processed' });
         }
+        throw dupErr;
+      }
+      try {
+        await updateRankScore(user._id, pointsToAward);
+      } catch (awardErr) {
+        // Roll the marker back so Shopify's retry (or a manual replay) can award the points
+        await ShopifyWebhookEvent.deleteOne({ orderId: String(order.id) }).catch(() => {});
+        throw awardErr;
       }
       console.log(`✅ Shopify webhook: awarded ${pointsToAward} points to ${email} for order ${order.id} ($${order.total_price})`);
     }
@@ -209,8 +217,23 @@ app.post('/api/webhooks/shopify/orders-create', express.raw({ type: 'application
 });
 
 // Middleware
-app.use(express.json());
+app.set('trust proxy', 1); // Render/Vercel sit behind one proxy; needed for per-IP rate limits
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' }, contentSecurityPolicy: false }));
+app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
+
+// Rate limits: tight on credential endpoints, looser across the rest of the API
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many attempts. Please wait a few minutes and try again.' } });
+const writeLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'You are doing that too quickly. Please slow down.' } });
+const apiLimiter = rateLimit({ windowMs: 60 * 1000, limit: 300, standardHeaders: 'draft-7', legacyHeaders: false });
+app.use('/api/login', authLimiter);
+app.use('/api/signup', authLimiter);
+app.use('/api/auth/forgot-password', authLimiter);
+app.use('/api/auth/reset-password', authLimiter);
+app.use('/api/auth/google', authLimiter);
+app.use('/api/auth/apple', authLimiter);
+app.use('/api/create-payment-intent', writeLimiter);
+app.use('/api', (req, res, next) => (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS' ? apiLimiter(req, res, next) : writeLimiter(req, res, next)));
 
 // CORS Configuration - Allows multiple origins
 const allowedOrigins = [
@@ -658,7 +681,10 @@ marketplaceListingSchema.index({ boostedUntil: -1, createdAt: -1 });
 const MarketplaceListing = mongoose.model('MarketplaceListing', marketplaceListingSchema);
 
 // --- HELPERS ---
-const JWT_SECRET = process.env.JWT_SECRET || 'majority-hair-default-secret-change-me';
+if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
+  throw new Error('JWT_SECRET must be set in production');
+}
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-insecure-secret-do-not-use-in-production';
 
 const generateToken = (userId, rememberMe = false) => {
   return jwt.sign({ userId }, JWT_SECRET, {
@@ -859,6 +885,41 @@ const updateRankScore = async (userId, pointsToAdd) => {
     const updatedUser = await User.findById(userId);
     await sendRankUpEmail(updatedUser, newTitle);
   }
+};
+
+
+// Public responses must never carry other members' email addresses.
+const maskEmail = (email) => {
+  const e = String(email || '');
+  const at = e.indexOf('@');
+  if (at < 1) return '';
+  return `${e[0]}***${e.slice(at)}`;
+};
+// Owner sees their own address (clients compare it to decide whether to show edit/delete); everyone else gets ''.
+const hideEmail = (value, viewerEmail) =>
+  (viewerEmail && String(value || '').toLowerCase() === viewerEmail) ? value : '';
+// Optional auth: returns the viewer's email (lower-case) or ''.
+const getViewerEmail = async (req) => {
+  try {
+    let token = req.cookies?.token;
+    const authHeader = req.headers.authorization;
+    if (!token && authHeader?.startsWith('Bearer ')) token = authHeader.split(' ')[1];
+    if (!token) return '';
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const viewer = await User.findById(decoded.userId, 'email');
+    return String(viewer?.email || '').toLowerCase();
+  } catch { return ''; }
+};
+const scrubDumaItemForPublic = (item, viewerEmail) => {
+  const mine = viewerEmail && String(item.submittedBy || '').toLowerCase() === viewerEmail;
+  item.isOwner = Boolean(mine);
+  item.submittedBy = mine ? item.submittedBy : '';
+  item.comments = (item.comments || []).map((c) => ({
+    ...c,
+    isOwner: Boolean(viewerEmail && String(c.author || '').toLowerCase() === viewerEmail),
+    author: hideEmail(c.author, viewerEmail),
+  }));
+  return item;
 };
 
 // --- ROUTES ---
@@ -1245,8 +1306,12 @@ app.post('/api/auth/reset-password/:token', async (req, res) => {
 // STRIPE
 app.post('/api/create-payment-intent', async (req, res) => {
   try {
-    const { amount } = req.body;
-    if (!amount) return res.status(400).json({ error: "Amount required" });
+    const amount = Number(req.body?.amount);
+    // Amount is in cents. Reject junk and absurd values (the client still supplies the total,
+    // so move pricing server-side when a catalog lookup is available).
+    if (!Number.isFinite(amount) || amount < 50 || amount > 500000) {
+      return res.status(400).json({ error: 'A valid amount is required' });
+    }
 
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(amount),
@@ -1255,7 +1320,8 @@ app.post('/api/create-payment-intent', async (req, res) => {
     });
     res.json({ clientSecret: paymentIntent.client_secret });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -1316,6 +1382,9 @@ app.get('/api/duma', async (req, res) => {
         !c.hiddenByModeration && !viewerBlocked.has(String(c.author || '').toLowerCase()));
     }
 
+    const viewerEmail = await getViewerEmail(req);
+    const scrub = (list) => list.map((it) => scrubDumaItemForPublic(it, viewerEmail));
+
     // De-duplicate by submittedBy email — keep only the most recent item per user
     if (deduplicate === 'true') {
       const seen = new Set();
@@ -1328,12 +1397,13 @@ app.get('/api/duma', async (req, res) => {
         }
         // Items without a submitter are excluded from the deduplicated community grid
       }
-      return res.json(deduped);
+      return res.json(scrub(deduped));
     }
 
-    res.json(enriched);
+    res.json(scrub(enriched));
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -1393,8 +1463,17 @@ app.post('/api/duma/:id/vote', authMiddleware, async (req, res) => {
       throw dupErr;
     }
 
-    const item = await DumaItem.findByIdAndUpdate(req.params.id, { $inc: { [`votes.${voteType}`]: 1 } }, { new: true });
-    if (!item) return res.status(404).json({ error: 'Item not found' });
+    let item;
+    try {
+      item = await DumaItem.findByIdAndUpdate(req.params.id, { $inc: { [`votes.${voteType}`]: 1 } }, { new: true });
+    } catch (incErr) {
+      await Vote.deleteOne({ userId: req.user._id, targetId: req.params.id }).catch(() => {});
+      throw incErr;
+    }
+    if (!item) {
+      await Vote.deleteOne({ userId: req.user._id, targetId: req.params.id }).catch(() => {});
+      return res.status(404).json({ error: 'Item not found' });
+    }
 
     // Award points for voting
     await updateRankScore(req.user._id, 2);
@@ -1413,7 +1492,8 @@ app.post('/api/duma/:id/vote', authMiddleware, async (req, res) => {
 
     res.json({ success: true, yourVote: VOTE_LABELS[voteType], votes: voteCounts(item.votes) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -1579,8 +1659,20 @@ app.post('/api/duma/culture', authMiddleware, async (req, res) => {
   try {
     const { prompt, response, videoUrl, perspective, category, submitterAvatar, location, mediaUrls } = req.body;
     if (rejectIfObjectionable(res, prompt, response, perspective, location)) return;
+    const isHttp = (v) => typeof v === 'string' && /^https?:\/\/\S+\.\S+/i.test(v.trim());
+    if (typeof prompt !== 'string' || prompt.length > 500) return res.status(400).json({ error: 'A prompt of 500 characters or fewer is required' });
+    if (response !== undefined && (typeof response !== 'string' || response.length > 10000)) return res.status(400).json({ error: 'Response must be 10,000 characters or fewer' });
+    if (mediaUrls !== undefined && (!Array.isArray(mediaUrls) || mediaUrls.length > 6 || !mediaUrls.every(isHttp))) {
+      return res.status(400).json({ error: 'mediaUrls must be up to 6 http(s) URLs' });
+    }
+    if (videoUrl && !isHttp(videoUrl)) return res.status(400).json({ error: 'videoUrl must be an http(s) URL' });
     const rankTitle = getRankTitle(req.user.rank_score || 1);
-    const isVideoSubmission = Boolean(videoUrl);
+    // The +100 video bonus only counts for a video this member actually uploaded through /api/media/upload
+    const isVideoSubmission = Boolean(videoUrl) &&
+      Boolean(await Media.exists({ userId: req.user._id, storageUrl: videoUrl, type: 'video' }));
+    // Points are capped at 10 rewarded posts per rolling 24 hours (posting itself is unaffected)
+    const recentPosts = await DumaItem.countDocuments({ submitterId: req.user._id, type: 'Culture', createdAt: { $gte: new Date(Date.now() - 24 * 3600 * 1000) } });
+    const pointsEligible = recentPosts < 10;
 
     const item = await DumaItem.create({
       type: 'Culture',
@@ -1601,8 +1693,8 @@ app.post('/api/duma/culture', authMiddleware, async (req, res) => {
     });
 
     // Award +100 pts for video submissions, +1 pt for text-only
-    const pointsToAward = isVideoSubmission ? 100 : 1;
-    await updateRankScore(req.user._id, pointsToAward);
+    const pointsToAward = pointsEligible ? (isVideoSubmission ? 100 : 1) : 0;
+    if (pointsToAward > 0) await updateRankScore(req.user._id, pointsToAward);
 
     res.status(201).json({
       message: isVideoSubmission
@@ -1612,7 +1704,8 @@ app.post('/api/duma/culture', authMiddleware, async (req, res) => {
       pointsAwarded: pointsToAward
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -2012,7 +2105,8 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
       avatarSlots: user.avatarSlots || [null, null, null, null, null, null],
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -2082,7 +2176,8 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
       avatarSlots: user.avatarSlots,
     }});
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 // GET /api/social/status - returns which social platforms the user has connected
@@ -2117,7 +2212,8 @@ app.put('/api/profile/social-links', authMiddleware, async (req, res) => {
     
     res.json({ success: true, message: 'Social links updated', socialLinks: user.socialLinks });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -2133,7 +2229,8 @@ app.put('/api/profile/avatar', authMiddleware, async (req, res) => {
     await User.findByIdAndUpdate(req.user._id, { avatarUrl, profilePictureUrl: avatarUrl });
     res.json({ success: true, avatarUrl });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -2201,7 +2298,8 @@ app.post('/api/profile/add-points', authMiddleware, async (req, res) => {
     const user = await User.findById(req.user._id);
     res.json({ success: true, rank_score: user.rank_score, rank_title: getRankTitle(user.rank_score || 1) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -2234,7 +2332,8 @@ app.post('/api/profile/save-formula', authMiddleware, async (req, res) => {
 
     res.json({ success: true, currentFormula: user.currentFormula });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -2370,7 +2469,8 @@ app.post('/api/media/confirm', authMiddleware, async (req, res) => {
     await updateRankScore(req.user._id, 5);
     res.json({ success: true, media });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -2392,7 +2492,8 @@ app.delete('/api/media/:mediaId', authMiddleware, async (req, res) => {
     
     res.json({ success: true, message: 'Media deleted' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -2440,7 +2541,8 @@ app.get('/api/messages/inbox', authMiddleware, async (req, res) => {
 
     res.json(threads);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -2480,7 +2582,8 @@ app.get('/api/messages/thread', authMiddleware, async (req, res) => {
       })),
     );
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -2533,7 +2636,8 @@ app.post('/api/messages', authMiddleware, async (req, res) => {
       createdAt: message.createdAt,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
@@ -2551,7 +2655,6 @@ app.get('/api/users/:id', async (req, res) => {
 
     res.json({
       id: user._id,
-      email: user.email,
       displayName: user.displayName || '',
       avatarUrl: user.avatarUrl || user.profilePictureUrl || null,
       rank: getRankTitle(user.rank_score || 1),
@@ -2565,18 +2668,25 @@ app.get('/api/users/:id', async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Request failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
 // ========== LEADERBOARD ==========
 app.get('/api/leaderboard', async (req, res) => {
   try {
-    const users = await User.find({}, 'email rank_score rank_title')
+    const users = await User.find({}, 'email displayName rank_score rank_title')
       .sort({ rank_score: -1 })
       .limit(50)
       .lean();
-    res.json(users.map(u => ({ ...u, rank_title: getRankTitle(u.rank_score || 1) })));
+    res.json(users.map(({ email, ...u }) => ({
+      ...u,
+      // Masked so existing clients that print `email` don't break, without exposing the address
+      email: maskEmail(email),
+      displayName: u.displayName || '',
+      rank_title: getRankTitle(u.rank_score || 1),
+    })));
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch leaderboard' });
   }

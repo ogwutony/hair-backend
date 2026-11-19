@@ -11,7 +11,8 @@ RUN npm install --omit=dev
 # Copy the rest of the application source
 COPY . .
 
-# Expose the port the server listens on
+# Expose the port the server listens on (server.js reads PORT; default it to match EXPOSE)
+ENV PORT=10000
 EXPOSE 10000
 
 # Start the backend server
