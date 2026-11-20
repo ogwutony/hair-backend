@@ -298,7 +298,8 @@ const upload = multer({
 // image/heic — Cloudinary handles the format), 50MB each, at most 16 files
 const partnerUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 52428800, files: 16 },
+  // 10 products x 3 photos + a video, plus room for a creator photo
+  limits: { fileSize: 52428800, files: 34 },
   fileFilter: (req, file, cb) => {
     if (/^(image|video)\//.test(file.mimetype)) cb(null, true);
     else cb(new Error('Only photos and videos can be attached'));
@@ -508,6 +509,10 @@ const userSchema = new mongoose.Schema({
   // application (POST /api/duma/partner). Gates GET /api/wholesale/products.
   wholesaleApproved: { type: Boolean, default: false },
   wholesaleApprovedAt: { type: Date },
+  // Set when the user submits a Creator / Influencer application. Unlocks the Influencer menu item
+  // and marks their later Culture posts as influencer content (Duma Influencers tab).
+  influencerApplied: { type: Boolean, default: false },
+  influencerAppliedAt: { type: Date },
 
   // System / admin settings
   systemSettings: {
@@ -553,6 +558,7 @@ const dumaSchema = new mongoose.Schema({
   inventory:  { type: mongoose.Schema.Types.Mixed }, // Partner: structured inventory parameters
   contractConfirmed: { type: Boolean, default: false }, // Partner: digital contract confirmation
   partnerCategory: String, // Partner: category shown publicly (e.g. "Review Request")
+  influencer: { type: Boolean, default: false }, // Shown in the Duma Influencers tab (creator applications + their posts)
   partner: { type: mongoose.Schema.Types.Mixed }, // Partner: full private application (contact, EIN, details) — never sent to the public feed
   prompt:     String,
   response:   String,
@@ -1035,6 +1041,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     rank_title: getRankTitle(user.rank_score || 1),
     isPolitburoOrHigher: isPolitburoOrHigher(user.rank_score || 1),
     wholesaleApproved: !!user.wholesaleApproved,
+    influencerApplied: !!user.influencerApplied,
     termsAcceptedAt: user.termsAcceptedAt || null,
     termsVersion: user.termsVersion || null,
     blocked: user.blockedEmails || [],
@@ -1569,6 +1576,7 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
       mediaUrls: media.map((m) => m.url),
       partner: { ...application, media },
       contractConfirmed: true,
+      influencer: application.category === 'Creator / Influencer Partners',
       submittedBy: req.user.email,
       submitterRank: rankTitle,
       submitterId: req.user._id,
@@ -1578,11 +1586,35 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
 
     await updateRankScore(req.user._id, 10);
 
-    // Brand & Retail Partners get wholesale access straight away (no manual review step)
+    // Creator applications unlock the Influencer menu item; their later Culture posts go to the Influencers tab
+    let influencerApplied = !!req.user.influencerApplied;
+    if (application.category === 'Creator / Influencer Partners' && !influencerApplied) {
+      await User.updateOne({ _id: req.user._id }, { $set: { influencerApplied: true, influencerAppliedAt: new Date() } });
+      influencerApplied = true;
+    }
+
+    // Wholesale, Distributor & Retail Partners (value 'Brand & Retail Partners') get wholesale access straight away (no manual review step)
     let wholesaleApproved = !!req.user.wholesaleApproved;
     if (application.category === 'Brand & Retail Partners' && !wholesaleApproved) {
       await User.updateOne({ _id: req.user._id }, { $set: { wholesaleApproved: true, wholesaleApprovedAt: new Date() } });
       wholesaleApproved = true;
+    }
+
+    // Wholesale, Distributor & Retail applicants get a welcome email right away
+    if (application.category === 'Brand & Retail Partners' && application.contactEmail) {
+      const firstName = escapeHtml(application.name.split(/\s+/)[0] || application.name);
+      sendEmail(
+        application.contactEmail,
+        'Welcome to The Majorities Wholesale Program',
+        `<p>Hi ${firstName},</p>`
+          + `<p>Thank you for applying to become a Wholesale, Distributor, or Retail partner with The Majorities. `
+          + `We've received your application for <strong>${escapeHtml(application.company)}</strong>.</p>`
+          + `<p>Your account now has wholesale access, so you can browse wholesale pricing and place your first order at `
+          + `<a href="https://themajorities.com/collections/wholesale">themajorities.com/collections/wholesale</a>.</p>`
+          + `<p>Our partnerships team will review your payment and shipping preferences and reach out within 2 business days `
+          + `to finalize your terms. If you have questions in the meantime, just reply to this email.</p>`
+          + `<p>Welcome aboard,<br>The Majorities Team</p>`,
+      ).catch((e) => console.error('Wholesale welcome email failed:', e.message));
     }
 
     if (MODERATION_EMAILS.length) {
@@ -1592,7 +1624,8 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
         ['EIN', application.ein || '—'], application.venue
           ? ['Venue', `${application.venue.name} · ${application.venue.address}`]
           : ['Country', `${application.countryOfOrigin} → ${application.operatingCountry}`],
-        ['Website / social', application.websiteOrSocial || '—'], ['Tier', application.tier],
+        ['Website', application.website || '—'], ['Social media', application.socialMedia || application.websiteOrSocial || '—'],
+        ['Address', application.address || '—'], ['Tier', application.tier],
         ...Object.entries(application.details).filter(([, v]) => v).map(([k, v]) => [k, v]),
         ['Media', media.map((m) => m.url).join('\n') || '—'], ['Submitted by', req.user.email],
       ];
@@ -1608,6 +1641,7 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
       message: "Your partner application has been submitted to The Majority's Duma",
       item: toPublicDumaItem(item.toObject()),
       wholesaleApproved,
+      influencerApplied,
     });
   } catch (err) {
     console.error('Partner application error:', err.message);
@@ -1672,6 +1706,7 @@ app.post('/api/duma/culture', authMiddleware, async (req, res) => {
       location: location || "",
       submitterDisplayName: req.user.displayName || req.user.email,
       mediaUrls: mediaUrls || [],
+      influencer: !!req.user.influencerApplied, // creators' posts also appear in the Influencers tab
     });
 
     // Award +100 pts for video submissions, +1 pt for text-only
