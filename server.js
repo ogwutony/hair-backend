@@ -1617,6 +1617,23 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
       ).catch((e) => console.error('Wholesale welcome email failed:', e.message));
     }
 
+    // Creator / Influencer applicants get a welcome email right away
+    if (application.category === 'Creator / Influencer Partners' && application.contactEmail) {
+      const firstName = escapeHtml(application.name.split(/\s+/)[0] || application.name);
+      sendEmail(
+        application.contactEmail,
+        'Welcome to The Majorities Creator Program',
+        `<p>Hi ${firstName},</p>`
+          + `<p>Thank you for applying to become a Creator / Influencer partner with The Majorities. `
+          + `We've received your application for <strong>${escapeHtml(application.company)}</strong>.</p>`
+          + `<p>The Influencer section is now unlocked on your account, so you can head to the Influencers page in The Duma `
+          + `to get started.</p>`
+          + `<p>Our partnerships team will review your application and reach out within 2 business days with your next steps, `
+          + `including your creator link and discount code. If you have questions in the meantime, just reply to this email.</p>`
+          + `<p>Welcome aboard,<br>The Majorities Team</p>`,
+      ).catch((e) => console.error('Creator welcome email failed:', e.message));
+    }
+
     if (MODERATION_EMAILS.length) {
       const rows = [
         ['Category', application.category], ['Company / name', application.company],
