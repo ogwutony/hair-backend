@@ -3398,6 +3398,7 @@ const removeReportedContent = async (report) => {
   if (!mongoose.isValidObjectId(id)) return;
   if (report.contentType === 'duma') {
     await DumaItem.updateOne({ _id: id }, { $set: { hiddenByModeration: true } });
+    await setCreatorAwardsForPost(id, true); // a removed creator review loses its points
   } else if (report.contentType === 'comment') {
     await DumaItem.updateOne({ 'comments._id': id }, { $set: { 'comments.$.hiddenByModeration': true } });
   } else if (report.contentType === 'message') {
@@ -3492,7 +3493,9 @@ const setDumaHidden = (hidden) => async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: 'Invalid id' });
   try {
     await DumaItem.updateOne({ _id: req.params.id }, { $set: { hiddenByModeration: hidden } });
-    res.json({ success: true });
+    // Creator reviews: hiding takes the post's points back, unhiding gives them back
+    const pointsChanged = await setCreatorAwardsForPost(req.params.id, hidden);
+    res.json({ success: true, pointsChanged });
   } catch (err) {
     res.status(500).json({ error: 'Could not update post' });
   }
@@ -3517,6 +3520,8 @@ const creatorAwardSchema = new mongoose.Schema({
   points:       { type: Number, required: true }, // what was paid (after the daily cap)
   basePoints:   { type: Number, required: true }, // what the rules priced it at
   repeat:       { type: Boolean, default: false },
+  revoked:      { type: Boolean, default: false }, // post hidden by moderation: points taken back
+  revokedAt:    { type: Date, default: null },
   createdAt:    { type: Date, default: Date.now },
 });
 // The same post link can never be paid twice, by anyone
@@ -3527,10 +3532,10 @@ const CreatorAward = mongoose.model('CreatorAward', creatorAwardSchema);
 
 const creatorProgram = createCreatorProgram({
   ledger: {
-    count: (query) => CreatorAward.countDocuments(query),
+    count: (query) => CreatorAward.countDocuments({ ...query, revoked: { $ne: true } }),
     pointsSince: async (userId, since) => {
       const [row] = await CreatorAward.aggregate([
-        { $match: { userId, createdAt: { $gte: since } } },
+        { $match: { userId, createdAt: { $gte: since }, revoked: { $ne: true } } },
         { $group: { _id: null, total: { $sum: '$points' } } },
       ]);
       return row ? row.total : 0;
@@ -3541,6 +3546,34 @@ const creatorProgram = createCreatorProgram({
   // The ranking system: the member's rank score on the profile page
   awardPoints: (user, points) => updateRankScore(user._id, points),
 });
+
+// Hiding a creator's Duma post takes back the points it earned; unhiding gives them back.
+// Returns the change in points (negative when taken back). Social-link awards are not affected.
+const setCreatorAwardsForPost = async (dumaItemId, hidden) => {
+  if (!mongoose.isValidObjectId(String(dumaItemId))) return 0;
+  const rows = await CreatorAward.find({ dumaItemId, revoked: hidden ? { $ne: true } : true });
+  let change = 0;
+  for (const row of rows) {
+    const updated = await CreatorAward.updateOne(
+      { _id: row._id, revoked: hidden ? { $ne: true } : true },
+      { $set: { revoked: hidden, revokedAt: hidden ? new Date() : null } },
+    );
+    if (!updated.modifiedCount || !row.points) continue;
+    const delta = hidden ? -row.points : row.points;
+    if (delta > 0) {
+      await updateRankScore(row.userId, delta);
+    } else {
+      // Take points back without a rank-up email; the score never drops below 1
+      const user = await User.findById(row.userId, 'rank_score');
+      if (user) {
+        const score = Math.max(1, (user.rank_score || 1) + delta);
+        await User.updateOne({ _id: row.userId }, { $set: { rank_score: score, rank_title: getRankTitle(score) } });
+      }
+    }
+    change += delta;
+  }
+  return change;
+};
 
 const CREATOR_CODE_ERROR = "We couldn't verify that creator code with that email. Use the email on your The Majorities community account, or contact us.";
 const creatorVerifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false, message: { ok: false, error: 'Too many attempts. Please wait a few minutes and try again.' } });
@@ -3617,7 +3650,7 @@ app.post('/api/creator/social-submit', async (req, res) => {
 // POST /api/creator/duma-submit (multipart: code, email, name, product_handle, description, photos[], video)
 const CREATOR_MAX_PHOTOS = 6;
 const CREATOR_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
-const CREATOR_VIDEO_MAX_BYTES = 50 * 1024 * 1024;
+const CREATOR_VIDEO_MAX_BYTES = 100 * 1024 * 1024; // Cloudinary's standard per-video limit
 const CREATOR_EXT_MIME = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', heic: 'image/heic', heif: 'image/heif', mp4: 'video/mp4', mov: 'video/quicktime' };
 const creatorFileMime = (file) => {
   const ext = String(file.originalname || '').split('.').pop().toLowerCase();
@@ -3640,7 +3673,7 @@ const creatorUpload = multer({
 const parseCreatorUpload = (req, res, next) => {
   creatorUpload.fields([{ name: 'photos', maxCount: CREATOR_MAX_PHOTOS }, { name: 'video', maxCount: 1 }])(req, res, (error) => {
     if (!error) return next();
-    const message = error.code === 'LIMIT_FILE_SIZE' ? 'Videos must be 50 MB or smaller.'
+    const message = error.code === 'LIMIT_FILE_SIZE' ? 'Videos must be 100 MB or smaller.'
       : error.code === 'LIMIT_FILE_COUNT' || error.code === 'LIMIT_UNEXPECTED_FILE' ? `Add up to ${CREATOR_MAX_PHOTOS} photos and one video.`
         : error.message && error.message !== 'UNEXPECTED_FIELD' ? error.message : 'Those files could not be uploaded.';
     return creatorFail(res, 400, message);
@@ -3734,7 +3767,7 @@ app.get('/api/admin/creators', authMiddleware, requireAdmin, async (req, res) =>
     const users = await User.find({ $or: [{ influencerApplied: true }, { creatorCode: { $type: 'string' } }] },
       'email displayName creatorCode creatorCodeIssuedAt influencerAppliedAt rank_score banned').sort({ influencerAppliedAt: -1 }).limit(500).lean();
     const totals = await CreatorAward.aggregate([
-      { $match: { userId: { $in: users.map((u) => u._id) } } },
+      { $match: { userId: { $in: users.map((u) => u._id) }, revoked: { $ne: true } } },
       { $group: { _id: '$userId', points: { $sum: '$points' }, submissions: { $sum: 1 } } },
     ]);
     const byUser = new Map(totals.map((t) => [String(t._id), t]));
