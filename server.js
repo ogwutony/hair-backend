@@ -509,6 +509,10 @@ const userSchema = new mongoose.Schema({
   // application (POST /api/duma/partner). Gates GET /api/wholesale/products.
   wholesaleApproved: { type: Boolean, default: false },
   wholesaleApprovedAt: { type: Date },
+  // Set when the user submits a Creator / Influencer application. Unlocks the Influencer menu item
+  // and marks their later Culture posts as influencer content (Duma Influencers tab).
+  influencerApplied: { type: Boolean, default: false },
+  influencerAppliedAt: { type: Date },
 
   // System / admin settings
   systemSettings: {
@@ -554,6 +558,7 @@ const dumaSchema = new mongoose.Schema({
   inventory:  { type: mongoose.Schema.Types.Mixed }, // Partner: structured inventory parameters
   contractConfirmed: { type: Boolean, default: false }, // Partner: digital contract confirmation
   partnerCategory: String, // Partner: category shown publicly (e.g. "Review Request")
+  influencer: { type: Boolean, default: false }, // Shown in the Duma Influencers tab (creator applications + their posts)
   partner: { type: mongoose.Schema.Types.Mixed }, // Partner: full private application (contact, EIN, details) — never sent to the public feed
   prompt:     String,
   response:   String,
@@ -1036,6 +1041,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     rank_title: getRankTitle(user.rank_score || 1),
     isPolitburoOrHigher: isPolitburoOrHigher(user.rank_score || 1),
     wholesaleApproved: !!user.wholesaleApproved,
+    influencerApplied: !!user.influencerApplied,
     termsAcceptedAt: user.termsAcceptedAt || null,
     termsVersion: user.termsVersion || null,
     blocked: user.blockedEmails || [],
@@ -1570,6 +1576,7 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
       mediaUrls: media.map((m) => m.url),
       partner: { ...application, media },
       contractConfirmed: true,
+      influencer: application.category === 'Creator / Influencer Partners',
       submittedBy: req.user.email,
       submitterRank: rankTitle,
       submitterId: req.user._id,
@@ -1578,6 +1585,13 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
     });
 
     await updateRankScore(req.user._id, 10);
+
+    // Creator applications unlock the Influencer menu item; their later Culture posts go to the Influencers tab
+    let influencerApplied = !!req.user.influencerApplied;
+    if (application.category === 'Creator / Influencer Partners' && !influencerApplied) {
+      await User.updateOne({ _id: req.user._id }, { $set: { influencerApplied: true, influencerAppliedAt: new Date() } });
+      influencerApplied = true;
+    }
 
     // Wholesale, Distributor & Retail Partners (value 'Brand & Retail Partners') get wholesale access straight away (no manual review step)
     let wholesaleApproved = !!req.user.wholesaleApproved;
@@ -1627,6 +1641,7 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
       message: "Your partner application has been submitted to The Majority's Duma",
       item: toPublicDumaItem(item.toObject()),
       wholesaleApproved,
+      influencerApplied,
     });
   } catch (err) {
     console.error('Partner application error:', err.message);
@@ -1691,6 +1706,7 @@ app.post('/api/duma/culture', authMiddleware, async (req, res) => {
       location: location || "",
       submitterDisplayName: req.user.displayName || req.user.email,
       mediaUrls: mediaUrls || [],
+      influencer: !!req.user.influencerApplied, // creators' posts also appear in the Influencers tab
     });
 
     // Award +100 pts for video submissions, +1 pt for text-only
