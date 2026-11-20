@@ -343,6 +343,10 @@ const { findNearestPlace, parseCoordinate, isPlacesConfigured } = require('./lib
 const { validatePartnerApplication, publicPartnerSummary, toPublicDumaItem } = require('./lib/partners');
 const { fetchWholesaleProducts } = require('./lib/wholesale');
 const { rejectIfObjectionable } = require('./lib/contentFilter');
+const {
+  PRODUCTS: CREATOR_PRODUCTS, productUrl: creatorProductUrl, createCreatorProgram, generateCreatorCode,
+  normalizeCreatorCode, normalizeEmail, cleanText,
+} = require('./lib/creatorProgram');
 
 // Premium Partner threshold — 900,000 points ("Supreme Lizard King"), matching the web and mobile apps
 const PARTNER_PREMIUM_MIN = 900000;
@@ -513,6 +517,10 @@ const userSchema = new mongoose.Schema({
   // and marks their later Culture posts as influencer content (Duma Influencers tab).
   influencerApplied: { type: Boolean, default: false },
   influencerAppliedAt: { type: Date },
+  // Creator program: code issued by an admin (POST /api/admin/creators/code); checklist ticks
+  creatorCode: { type: String, default: undefined },
+  creatorCodeIssuedAt: { type: Date },
+  creatorTasks: { app: { type: Boolean, default: false }, purchase: { type: Boolean, default: false } },
 
   // System / admin settings
   systemSettings: {
@@ -531,6 +539,7 @@ const userSchema = new mongoose.Schema({
     default: []
   }
 });
+userSchema.index({ creatorCode: 1 }, { unique: true, partialFilterExpression: { creatorCode: { $type: 'string' } } });
 const User = mongoose.model('User', userSchema);
 
 const Order = mongoose.model('Order', new mongoose.Schema({
@@ -594,6 +603,11 @@ const dumaSchema = new mongoose.Schema({
     }],
     default: [],
   },
+  // Creator program reviews (POST /api/creator/duma-submit)
+  creatorReview: { type: Boolean, default: false },
+  productHandle: String,
+  productTitle: String,
+  productUrl: String,
   createdAt:  { type: Date, default: Date.now },
   editedAt:   Date // set when the author edits the post (PUT /api/duma/:id)
 });
@@ -3485,6 +3499,298 @@ const setDumaHidden = (hidden) => async (req, res) => {
 };
 app.post('/api/admin/duma/:id/hide', authMiddleware, requireAdmin, setDumaHidden(true));
 app.post('/api/admin/duma/:id/unhide', authMiddleware, requireAdmin, setDumaHidden(false));
+
+// ============================================================
+// CREATOR PROGRAM — themajorities.com/pages/influencers (Shopify theme section creator-checklist)
+// Approved creators sign in with a creator code + the email on their community account. Duma
+// posts become Culture posts in the Duma's Influencers tab; points go into the member's rank
+// score (profile page). Rules live in lib/creatorProgram.js.
+// ============================================================
+const creatorAwardSchema = new mongoose.Schema({
+  userId:       { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  creatorCode:  { type: String, required: true },
+  productHandle: { type: String, required: true },
+  platform:     { type: String, required: true }, // 'duma' or a key of PLATFORMS
+  url:          { type: String, default: null },
+  urlKey:       { type: String, default: null },  // duplicate-check identity of a social post
+  dumaItemId:   { type: mongoose.Schema.Types.ObjectId, ref: 'DumaItem', default: null },
+  points:       { type: Number, required: true }, // what was paid (after the daily cap)
+  basePoints:   { type: Number, required: true }, // what the rules priced it at
+  repeat:       { type: Boolean, default: false },
+  createdAt:    { type: Date, default: Date.now },
+});
+// The same post link can never be paid twice, by anyone
+creatorAwardSchema.index({ urlKey: 1 }, { unique: true, partialFilterExpression: { urlKey: { $type: 'string' } } });
+creatorAwardSchema.index({ userId: 1, productHandle: 1, platform: 1 });
+creatorAwardSchema.index({ userId: 1, createdAt: -1 });
+const CreatorAward = mongoose.model('CreatorAward', creatorAwardSchema);
+
+const creatorProgram = createCreatorProgram({
+  ledger: {
+    count: (query) => CreatorAward.countDocuments(query),
+    pointsSince: async (userId, since) => {
+      const [row] = await CreatorAward.aggregate([
+        { $match: { userId, createdAt: { $gte: since } } },
+        { $group: { _id: null, total: { $sum: '$points' } } },
+      ]);
+      return row ? row.total : 0;
+    },
+    insert: (row) => CreatorAward.create(row),
+    listForUser: (userId) => CreatorAward.find({ userId }).lean(),
+  },
+  // The ranking system: the member's rank score on the profile page
+  awardPoints: (user, points) => updateRankScore(user._id, points),
+});
+
+const CREATOR_CODE_ERROR = "We couldn't verify that creator code with that email. Use the email on your The Majorities community account, or contact us.";
+const creatorVerifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false, message: { ok: false, error: 'Too many attempts. Please wait a few minutes and try again.' } });
+app.use('/api/creator/verify', creatorVerifyLimiter);
+
+// The creator behind a code + email, or null. The email must match their community account.
+const findCreator = async (body = {}) => {
+  const code = normalizeCreatorCode(body.code);
+  const email = normalizeEmail(body.email);
+  if (!code || !email) return null;
+  const user = await User.findOne({ creatorCode: code });
+  if (!user || user.banned || normalizeEmail(user.email) !== email) return null;
+  return user;
+};
+const creatorFail = (res, status, error) => res.status(status).json({ ok: false, error });
+
+// POST /api/creator/verify { code, email, name } -> { ok, creator: { name }, progress }
+app.post('/api/creator/verify', async (req, res) => {
+  try {
+    const user = await findCreator(req.body);
+    if (!user) return creatorFail(res, 401, CREATOR_CODE_ERROR);
+    res.json({
+      ok: true,
+      creator: { name: user.displayName || cleanText(req.body?.name, 80) || '' },
+      progress: await creatorProgram.progress(user),
+    });
+  } catch (err) {
+    console.error('Creator verify failed:', err.message);
+    creatorFail(res, 500, 'Something went wrong. Please try again.');
+  }
+});
+
+// POST /api/creator/progress { code, email, task: 'app' | 'purchase', done }
+app.post('/api/creator/progress', async (req, res) => {
+  try {
+    const user = await findCreator(req.body);
+    if (!user) return creatorFail(res, 401, CREATOR_CODE_ERROR);
+    const task = req.body?.task;
+    if (task !== 'app' && task !== 'purchase') return creatorFail(res, 400, 'Unknown task.');
+    await User.updateOne({ _id: user._id }, { $set: { [`creatorTasks.${task}`]: req.body.done === true } });
+    const fresh = await User.findById(user._id);
+    res.json({ ok: true, progress: await creatorProgram.progress(fresh) });
+  } catch (err) {
+    console.error('Creator progress failed:', err.message);
+    creatorFail(res, 500, 'Something went wrong. Please try again.');
+  }
+});
+
+// POST /api/creator/social-submit { code, email, product_handle, platform, url }
+app.post('/api/creator/social-submit', async (req, res) => {
+  try {
+    const user = await findCreator(req.body);
+    if (!user) return creatorFail(res, 401, CREATOR_CODE_ERROR);
+    const result = await creatorProgram.submitSocial(user, {
+      productHandle: String(req.body?.product_handle || ''),
+      platform: String(req.body?.platform || ''),
+      url: String(req.body?.url || ''),
+    });
+    if (result.error) return creatorFail(res, result.status, result.error);
+    const fresh = await User.findById(user._id);
+    res.status(201).json({
+      ok: true,
+      points_awarded: result.points,
+      capped: result.capped,
+      message: result.capped ? "Saved. You've reached today's points limit, so this post earned fewer points." : undefined,
+      progress: await creatorProgram.progress(fresh),
+    });
+  } catch (err) {
+    console.error('Creator social submit failed:', err.message);
+    creatorFail(res, 500, 'Your link was not saved. Please try again.');
+  }
+});
+
+// POST /api/creator/duma-submit (multipart: code, email, name, product_handle, description, photos[], video)
+const CREATOR_MAX_PHOTOS = 6;
+const CREATOR_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
+const CREATOR_VIDEO_MAX_BYTES = 50 * 1024 * 1024;
+const CREATOR_EXT_MIME = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', heic: 'image/heic', heif: 'image/heif', mp4: 'video/mp4', mov: 'video/quicktime' };
+const creatorFileMime = (file) => {
+  const ext = String(file.originalname || '').split('.').pop().toLowerCase();
+  const declared = String(file.mimetype || '').toLowerCase().replace('image/jpg', 'image/jpeg');
+  const allowed = file.fieldname === 'photos'
+    ? ['image/jpeg', 'image/png', 'image/heic', 'image/heif']
+    : ['video/mp4', 'video/quicktime'];
+  if (allowed.includes(declared)) return declared;
+  return allowed.includes(CREATOR_EXT_MIME[ext]) ? CREATOR_EXT_MIME[ext] : null;
+};
+const creatorUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: CREATOR_VIDEO_MAX_BYTES, files: CREATOR_MAX_PHOTOS + 1, fields: 20, fieldSize: 20000 },
+  fileFilter: (req, file, cb) => {
+    if (!['photos', 'video'].includes(file.fieldname)) return cb(new Error('UNEXPECTED_FIELD'));
+    if (!creatorFileMime(file)) return cb(new Error(file.fieldname === 'photos' ? 'Photos must be JPG, PNG or HEIC.' : 'Videos must be MP4 or MOV.'));
+    cb(null, true);
+  },
+});
+const parseCreatorUpload = (req, res, next) => {
+  creatorUpload.fields([{ name: 'photos', maxCount: CREATOR_MAX_PHOTOS }, { name: 'video', maxCount: 1 }])(req, res, (error) => {
+    if (!error) return next();
+    const message = error.code === 'LIMIT_FILE_SIZE' ? 'Videos must be 50 MB or smaller.'
+      : error.code === 'LIMIT_FILE_COUNT' || error.code === 'LIMIT_UNEXPECTED_FILE' ? `Add up to ${CREATOR_MAX_PHOTOS} photos and one video.`
+        : error.message && error.message !== 'UNEXPECTED_FIELD' ? error.message : 'Those files could not be uploaded.';
+    return creatorFail(res, 400, message);
+  });
+};
+
+app.post('/api/creator/duma-submit', parseCreatorUpload, async (req, res) => {
+  try {
+    const user = await findCreator(req.body);
+    if (!user) return creatorFail(res, 401, CREATOR_CODE_ERROR);
+    const productHandle = String(req.body?.product_handle || '');
+    const productTitle = CREATOR_PRODUCTS[productHandle];
+    if (!productTitle) return creatorFail(res, 400, 'Choose a product from the checklist.');
+    const description = cleanText(req.body?.description, 2000);
+    if (!description) return creatorFail(res, 400, 'Write a short description of the product.');
+    if (rejectIfObjectionable(res, description, req.body?.name)) return;
+
+    const photos = req.files?.photos || [];
+    const videos = req.files?.video || [];
+    if (!photos.length && !videos.length) return creatorFail(res, 400, 'Add at least one photo or a video.');
+    if (photos.some((f) => f.size > CREATOR_PHOTO_MAX_BYTES)) return creatorFail(res, 400, 'Photos must be 10 MB or smaller.');
+    const isHeic = (f) => /^image\/hei[cf]$/.test(creatorFileMime(f));
+    if (storage.provider === 'r2' && photos.some(isHeic)) {
+      return creatorFail(res, 400, 'HEIC photos are not supported right now. Please send JPG or PNG.');
+    }
+
+    const uploadOne = async (file) => {
+      const mimetype = creatorFileMime(file);
+      const result = await uploadToCloudinary(file.buffer, { mimetype, folder: 'creator_reviews' });
+      // Browsers can't show HEIC; Cloudinary serves the same asset as JPG when asked for .jpg
+      const url = isHeic(file) ? result.secure_url.replace(/\.(heic|heif)$/i, '.jpg') : result.secure_url;
+      await Media.create({
+        userId: user._id, filename: file.originalname, originalName: file.originalname, mimetype,
+        size: file.size, type: mimetype.startsWith('video') ? 'video' : 'image', storageUrl: url, uploadedAt: new Date(),
+      });
+      return url;
+    };
+    let mediaUrls;
+    let videoUrl = null;
+    try {
+      mediaUrls = await Promise.all(photos.map(uploadOne));
+      if (videos[0]) videoUrl = await uploadOne(videos[0]);
+    } catch (uploadErr) {
+      return sendUploadError(res, uploadErr, 'Creator review upload');
+    }
+
+    const name = user.displayName || cleanText(req.body?.name, 80) || 'A creator';
+    const item = await DumaItem.create({
+      type: 'Culture',
+      category: 'Culture',
+      prompt: `${name} on ${productTitle}`.slice(0, 500),
+      response: description,
+      perspective: description,
+      videoUrl,
+      mediaUrls,
+      submittedBy: user.email,
+      submitterRank: getRankTitle(user.rank_score || 1),
+      submitterId: user._id,
+      submitterProfilePictureUrl: resolveProfilePictureUrl(user),
+      submitterSocialLinks: user.socialLinks || DEFAULT_SOCIAL_LINKS,
+      submitterAvatar: resolveProfilePictureUrl(user),
+      submitterDisplayName: name,
+      influencer: true,
+      creatorReview: true,
+      productHandle,
+      productTitle,
+      productUrl: creatorProductUrl(productHandle),
+    });
+
+    const result = await creatorProgram.recordDuma(user, { productHandle, dumaItemId: item._id });
+    const fresh = await User.findById(user._id);
+    res.status(201).json({
+      ok: true,
+      points_awarded: result.points,
+      capped: result.capped,
+      article_url: `https://community.themajorities.com/duma/${item._id}`,
+      progress: await creatorProgram.progress(fresh),
+    });
+  } catch (err) {
+    console.error('Creator Duma submit failed:', err.message);
+    creatorFail(res, 500, 'Your post was not saved. Please try again.');
+  }
+});
+
+// ── Creator codes (admin) ──
+const escapeCreatorHtml = (s = '') => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+// GET /api/admin/creators — creator applicants and code holders, with creator-program points
+app.get('/api/admin/creators', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const users = await User.find({ $or: [{ influencerApplied: true }, { creatorCode: { $type: 'string' } }] },
+      'email displayName creatorCode creatorCodeIssuedAt influencerAppliedAt rank_score banned').sort({ influencerAppliedAt: -1 }).limit(500).lean();
+    const totals = await CreatorAward.aggregate([
+      { $match: { userId: { $in: users.map((u) => u._id) } } },
+      { $group: { _id: '$userId', points: { $sum: '$points' }, submissions: { $sum: 1 } } },
+    ]);
+    const byUser = new Map(totals.map((t) => [String(t._id), t]));
+    res.json(users.map((u) => ({
+      email: u.email, displayName: u.displayName || '', creatorCode: u.creatorCode || null,
+      creatorCodeIssuedAt: u.creatorCodeIssuedAt || null, appliedAt: u.influencerAppliedAt || null,
+      rankScore: u.rank_score || 1, banned: !!u.banned,
+      creatorPoints: byUser.get(String(u._id))?.points || 0, submissions: byUser.get(String(u._id))?.submissions || 0,
+    })));
+  } catch (err) {
+    res.status(500).json({ error: 'Could not load creators' });
+  }
+});
+
+// POST /api/admin/creators/code { email, reissue } — approve a creator: issue (or reissue) their code and email it
+app.post('/api/admin/creators/code', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const user = email && await User.findOne({ email });
+    if (!user) return res.status(404).json({ error: 'No community account uses that email. Ask the creator to sign up first.' });
+    if (user.creatorCode && req.body?.reissue !== true) return res.json({ email: user.email, creatorCode: user.creatorCode, issued: false });
+    let code;
+    for (let i = 0; i < 5 && !code; i += 1) {
+      const candidate = generateCreatorCode();
+      if (!(await User.exists({ creatorCode: candidate }))) code = candidate;
+    }
+    if (!code) return res.status(500).json({ error: 'Could not create a code. Try again.' });
+    await User.updateOne({ _id: user._id }, { $set: { creatorCode: code, creatorCodeIssuedAt: new Date() } });
+    const pageUrl = 'https://themajorities.com/pages/influencers';
+    sendEmail(user.email, 'Your The Majorities creator code', `
+      <div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; padding: 24px; color: #222;">
+        <h1 style="font-size: 20px;">You're approved for the creator program</h1>
+        <p>Hi ${escapeCreatorHtml(user.displayName || '')}, your creator code is:</p>
+        <p style="font-size: 22px; font-weight: bold; letter-spacing: 2px;">${code}</p>
+        <p>Enter it with this email address (${escapeCreatorHtml(user.email)}) on the creator checklist to post reviews and earn points in your rank.</p>
+        <p><a href="${pageUrl}" style="display:inline-block;background:#1f5a46;color:#fff;padding:12px 20px;border-radius:6px;text-decoration:none;">Open the creator checklist</a></p>
+        <p style="color:#666;font-size:13px;">Keep this code private. It links submissions to your account.</p>
+      </div>`).catch((e) => console.error('Creator code email failed:', e.message));
+    res.json({ email: user.email, creatorCode: code, issued: true });
+  } catch (err) {
+    console.error('Creator code issue failed:', err.message);
+    res.status(500).json({ error: 'Could not issue a code' });
+  }
+});
+
+// POST /api/admin/creators/revoke { email } — the code stops working at once
+app.post('/api/admin/creators/revoke', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const result = await User.updateOne({ email }, { $unset: { creatorCode: 1, creatorCodeIssuedAt: 1 } });
+    if (!result.matchedCount) return res.status(404).json({ error: 'No community account uses that email.' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not revoke the code' });
+  }
+});
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));
