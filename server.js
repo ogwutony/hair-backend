@@ -1586,6 +1586,23 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
       wholesaleApproved = true;
     }
 
+    // Wholesale, Distributor & Retail applicants get a welcome email right away
+    if (application.category === 'Brand & Retail Partners' && application.contactEmail) {
+      const firstName = escapeHtml(application.name.split(/\s+/)[0] || application.name);
+      sendEmail(
+        application.contactEmail,
+        'Welcome to The Majorities Wholesale Program',
+        `<p>Hi ${firstName},</p>`
+          + `<p>Thank you for applying to become a Wholesale, Distributor, or Retail partner with The Majorities. `
+          + `We've received your application for <strong>${escapeHtml(application.company)}</strong>.</p>`
+          + `<p>Your account now has wholesale access, so you can browse wholesale pricing and place your first order at `
+          + `<a href="https://themajorities.com/collections/wholesale">themajorities.com/collections/wholesale</a>.</p>`
+          + `<p>Our partnerships team will review your payment and shipping preferences and reach out within 2 business days `
+          + `to finalize your terms. If you have questions in the meantime, just reply to this email.</p>`
+          + `<p>Welcome aboard,<br>The Majorities Team</p>`,
+      ).catch((e) => console.error('Wholesale welcome email failed:', e.message));
+    }
+
     if (MODERATION_EMAILS.length) {
       const rows = [
         ['Category', application.category], ['Company / name', application.company],
