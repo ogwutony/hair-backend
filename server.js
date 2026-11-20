@@ -298,7 +298,8 @@ const upload = multer({
 // image/heic — Cloudinary handles the format), 50MB each, at most 16 files
 const partnerUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 52428800, files: 16 },
+  // 10 products x 3 photos + a video, plus room for a creator photo
+  limits: { fileSize: 52428800, files: 34 },
   fileFilter: (req, file, cb) => {
     if (/^(image|video)\//.test(file.mimetype)) cb(null, true);
     else cb(new Error('Only photos and videos can be attached'));
@@ -1578,7 +1579,7 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
 
     await updateRankScore(req.user._id, 10);
 
-    // Brand & Retail Partners get wholesale access straight away (no manual review step)
+    // Wholesale, Distributor & Retail Partners (value 'Brand & Retail Partners') get wholesale access straight away (no manual review step)
     let wholesaleApproved = !!req.user.wholesaleApproved;
     if (application.category === 'Brand & Retail Partners' && !wholesaleApproved) {
       await User.updateOne({ _id: req.user._id }, { $set: { wholesaleApproved: true, wholesaleApprovedAt: new Date() } });
@@ -1592,7 +1593,8 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
         ['EIN', application.ein || '—'], application.venue
           ? ['Venue', `${application.venue.name} · ${application.venue.address}`]
           : ['Country', `${application.countryOfOrigin} → ${application.operatingCountry}`],
-        ['Website / social', application.websiteOrSocial || '—'], ['Tier', application.tier],
+        ['Website', application.website || '—'], ['Social media', application.socialMedia || application.websiteOrSocial || '—'],
+        ['Address', application.address || '—'], ['Tier', application.tier],
         ...Object.entries(application.details).filter(([, v]) => v).map(([k, v]) => [k, v]),
         ['Media', media.map((m) => m.url).join('\n') || '—'], ['Submitted by', req.user.email],
       ];
