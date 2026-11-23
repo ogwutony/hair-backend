@@ -343,6 +343,7 @@ const { findNearestPlace, parseCoordinate, isPlacesConfigured } = require('./lib
 const { validatePartnerApplication, publicPartnerSummary, toPublicDumaItem } = require('./lib/partners');
 const { fetchWholesaleProducts } = require('./lib/wholesale');
 const { rejectIfObjectionable } = require('./lib/contentFilter');
+const influencerAutomation = require('./lib/influencerAutomation');
 const {
   PRODUCTS: CREATOR_PRODUCTS, productUrl: creatorProductUrl, createCreatorProgram, generateCreatorCode,
   normalizeCreatorCode, normalizeEmail, cleanText,
@@ -521,6 +522,15 @@ const userSchema = new mongoose.Schema({
   creatorCode: { type: String, default: undefined },
   creatorCodeIssuedAt: { type: Date },
   creatorTasks: { app: { type: Boolean, default: false }, purchase: { type: Boolean, default: false } },
+  // Follower discount code (e.g. SARAHSMITH5) reserved when a Creator / Influencer application is
+  // submitted and sent to the Make scenario that creates it in Shopify and emails it (lib/influencerAutomation.js)
+  partnerDiscountCode: { type: String, default: undefined },
+  partnerDiscountCodeIssuedAt: { type: Date },
+  partnerAutomation: {
+    status: { type: String, default: undefined }, // 'sent' | 'failed'
+    lastAttemptAt: { type: Date },
+    error: { type: String },
+  },
 
   // System / admin settings
   systemSettings: {
@@ -540,6 +550,7 @@ const userSchema = new mongoose.Schema({
   }
 });
 userSchema.index({ creatorCode: 1 }, { unique: true, partialFilterExpression: { creatorCode: { $type: 'string' } } });
+userSchema.index({ partnerDiscountCode: 1 }, { unique: true, partialFilterExpression: { partnerDiscountCode: { $type: 'string' } } });
 const User = mongoose.model('User', userSchema);
 
 const Order = mongoose.model('Order', new mongoose.Schema({
@@ -1554,6 +1565,57 @@ const parsePartnerUpload = (req, res, next) => {
   });
 };
 
+// ── Creator / Influencer automation (Make webhook → Shopify discount → email) ──
+// Reserves the creator's discount code once per account. Returns the code, or null if they
+// already have one (re-applying never creates a second Shopify discount) or none could be reserved.
+const reservePartnerDiscountCode = async (user, fullName) => {
+  if (user.partnerDiscountCode) return null;
+  const percent = influencerAutomation.discountPercent();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const code = await influencerAutomation.reserveDiscountCode(
+      fullName, (c) => User.exists({ partnerDiscountCode: c }), percent,
+    );
+    if (!code) return null;
+    try {
+      const result = await User.updateOne(
+        { _id: user._id, partnerDiscountCode: { $exists: false } },
+        { $set: { partnerDiscountCode: code, partnerDiscountCodeIssuedAt: new Date() } },
+      );
+      return result.modifiedCount ? code : null;
+    } catch (err) {
+      if (err.code !== 11000) throw err; // another account took this code a moment ago: try the next one
+    }
+  }
+  return null;
+};
+
+// Sends the application to Make and records the outcome on the user. Never throws.
+const sendInfluencerToMake = async ({ user, application, code, item, media }) => {
+  const payload = influencerAutomation.buildWebhookPayload({
+    application, code, percent: influencerAutomation.discountPercent(), user, item, media,
+  });
+  const result = await influencerAutomation.sendToMake(payload);
+  const error = result.ok ? undefined : (result.error || `HTTP ${result.status || 'error'}`);
+  await User.updateOne({ _id: user._id }, {
+    $set: { partnerAutomation: { status: result.ok ? 'sent' : 'failed', lastAttemptAt: new Date(), error } },
+  }).catch(() => {});
+  if (!result.ok) {
+    console.error(`Influencer Make webhook failed for ${user.email}: ${error}`);
+    if (MODERATION_EMAILS.length) {
+      sendEmail(
+        MODERATION_EMAILS.join(','),
+        `[Partner] Influencer automation failed: ${String(application.name).slice(0, 60)}`,
+        `<p>The Make webhook did not accept the Creator / Influencer application from `
+          + `<strong>${escapeHtml(application.name)}</strong> (${escapeHtml(application.contactEmail)}).</p>`
+          + `<p>Reserved discount code: <strong>${escapeHtml(code)}</strong><br>Error: ${escapeHtml(error)}</p>`
+          + `<p>Retry with POST /api/admin/creators/discount-resend { "email": "${escapeHtml(user.email)}" }, `
+          + `or create the code in Shopify by hand.</p>`,
+      ).catch((e) => console.error('Automation failure email failed:', e.message));
+    }
+  }
+  return result;
+};
+
 app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, parsePartnerUpload, async (req, res) => {
   const { error, application } = validatePartnerApplication(req.body || {});
   if (error) return res.status(400).json({ error });
@@ -1607,6 +1669,23 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
       influencerApplied = true;
     }
 
+    // Creator / Influencer applicants: reserve their follower discount code and hand off to Make,
+    // which creates the code in Shopify and emails it. Runs after the response so Make can't slow it down.
+    const isInfluencer = application.category === 'Creator / Influencer Partners';
+    const automationOn = isInfluencer && influencerAutomation.isAutomationEnabled();
+    let discountCode = null;
+    if (automationOn) {
+      try {
+        discountCode = await reservePartnerDiscountCode(req.user, application.name);
+      } catch (codeErr) {
+        console.error('Influencer discount code reservation failed:', codeErr.message);
+      }
+      if (discountCode) {
+        sendInfluencerToMake({ user: req.user, application, code: discountCode, item, media })
+          .catch((e) => console.error('Influencer automation error:', e.message));
+      }
+    }
+
     // Wholesale, Distributor & Retail Partners (value 'Brand & Retail Partners') get wholesale access straight away (no manual review step)
     let wholesaleApproved = !!req.user.wholesaleApproved;
     if (application.category === 'Brand & Retail Partners' && !wholesaleApproved) {
@@ -1642,8 +1721,12 @@ app.post('/api/duma/partner', requireBearerAuthorizationHeader, authMiddleware, 
           + `We've received your application for <strong>${escapeHtml(application.company)}</strong>.</p>`
           + `<p>The Influencer section is now unlocked on your account, so you can head to the Influencers page in The Duma `
           + `to get started.</p>`
-          + `<p>Our partnerships team will review your application and reach out within 2 business days with your next steps, `
-          + `including your creator link and discount code. If you have questions in the meantime, just reply to this email.</p>`
+          + (discountCode
+            ? `<p>Your personal ${influencerAutomation.discountPercent()}% follower discount code is on its way in a separate email `
+              + `in the next few minutes. Our partnerships team will also reach out within 2 business days with your creator link. `
+              + `If you have questions in the meantime, just reply to this email.</p>`
+            : `<p>Our partnerships team will review your application and reach out within 2 business days with your next steps, `
+              + `including your creator link and discount code. If you have questions in the meantime, just reply to this email.</p>`)
           + `<p>Welcome aboard,<br>The Majorities Team</p>`,
       ).catch((e) => console.error('Creator welcome email failed:', e.message));
     }
@@ -3765,7 +3848,7 @@ const escapeCreatorHtml = (s = '') => String(s).replace(/&/g, '&amp;').replace(/
 app.get('/api/admin/creators', authMiddleware, requireAdmin, async (req, res) => {
   try {
     const users = await User.find({ $or: [{ influencerApplied: true }, { creatorCode: { $type: 'string' } }] },
-      'email displayName creatorCode creatorCodeIssuedAt influencerAppliedAt rank_score banned').sort({ influencerAppliedAt: -1 }).limit(500).lean();
+      'email displayName creatorCode creatorCodeIssuedAt influencerAppliedAt rank_score banned partnerDiscountCode partnerAutomation').sort({ influencerAppliedAt: -1 }).limit(500).lean();
     const totals = await CreatorAward.aggregate([
       { $match: { userId: { $in: users.map((u) => u._id) }, revoked: { $ne: true } } },
       { $group: { _id: '$userId', points: { $sum: '$points' }, submissions: { $sum: 1 } } },
@@ -3775,6 +3858,7 @@ app.get('/api/admin/creators', authMiddleware, requireAdmin, async (req, res) =>
       email: u.email, displayName: u.displayName || '', creatorCode: u.creatorCode || null,
       creatorCodeIssuedAt: u.creatorCodeIssuedAt || null, appliedAt: u.influencerAppliedAt || null,
       rankScore: u.rank_score || 1, banned: !!u.banned,
+      partnerDiscountCode: u.partnerDiscountCode || null, partnerAutomationStatus: u.partnerAutomation?.status || null,
       creatorPoints: byUser.get(String(u._id))?.points || 0, submissions: byUser.get(String(u._id))?.submissions || 0,
     })));
   } catch (err) {
@@ -3810,6 +3894,28 @@ app.post('/api/admin/creators/code', authMiddleware, requireAdmin, async (req, r
   } catch (err) {
     console.error('Creator code issue failed:', err.message);
     res.status(500).json({ error: 'Could not issue a code' });
+  }
+});
+
+// POST /api/admin/creators/discount-resend { email } — re-send a creator's latest Creator / Influencer
+// application to the Make scenario (e.g. after a Make outage). Reserves a code if they have none yet.
+app.post('/api/admin/creators/discount-resend', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    if (!influencerAutomation.isAutomationEnabled()) return res.status(400).json({ error: 'MAKE_INFLUENCER_WEBHOOK_URL is not set.' });
+    const email = normalizeEmail(req.body?.email);
+    const user = email && await User.findOne({ email });
+    if (!user) return res.status(404).json({ error: 'No community account uses that email.' });
+    const item = await DumaItem.findOne({ submitterId: user._id, type: 'Partner', partnerCategory: 'Creator / Influencer Partners' })
+      .sort({ _id: -1 }).lean();
+    if (!item?.partner) return res.status(404).json({ error: 'That account has no Creator / Influencer application.' });
+    const { media = [], ...application } = item.partner;
+    const code = user.partnerDiscountCode || await reservePartnerDiscountCode(user, application.name);
+    if (!code) return res.status(500).json({ error: 'Could not reserve a discount code.' });
+    const result = await sendInfluencerToMake({ user, application, code, item, media });
+    res.status(result.ok ? 200 : 502).json({ email: user.email, discountCode: code, sent: !!result.ok, error: result.error || null });
+  } catch (err) {
+    console.error('Influencer resend failed:', err.message);
+    res.status(500).json({ error: 'Could not resend' });
   }
 });
 
