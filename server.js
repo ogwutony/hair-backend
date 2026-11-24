@@ -346,7 +346,7 @@ const { rejectIfObjectionable } = require('./lib/contentFilter');
 const influencerAutomation = require('./lib/influencerAutomation');
 const {
   PRODUCTS: CREATOR_PRODUCTS, productUrl: creatorProductUrl, createCreatorProgram, generateCreatorCode,
-  normalizeCreatorCode, normalizeEmail, cleanText,
+  normalizeCreatorCode, normalizeEmail, cleanText, verifyPointsSignature,
 } = require('./lib/creatorProgram');
 
 // Premium Partner threshold — 900,000 points ("Supreme Lizard King"), matching the web and mobile apps
@@ -3672,6 +3672,24 @@ const findCreator = async (body = {}) => {
   return user;
 };
 const creatorFail = (res, status, error) => res.status(status).json({ ok: false, error });
+
+// POST /api/creator/points { email, ts, sig } -> { ok, rankScore }
+// Lets the Influencers page show a signed-in customer's profile points without an Affiliate code.
+// The theme signs the customer's email (see verifyPointsSignature); only the score is returned.
+const creatorPointsLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false, message: { ok: false, error: 'Too many requests.' } });
+app.post('/api/creator/points', creatorPointsLimiter, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const email = verifyPointsSignature(req.body || {}, process.env.CREATOR_POINTS_SECRET);
+    if (!email) return creatorFail(res, 401, 'Could not verify your account.');
+    const user = await User.findOne({ email }, 'rank_score banned');
+    if (!user || user.banned) return creatorFail(res, 404, 'No community account uses this email.');
+    res.json({ ok: true, rankScore: Math.max(1, user.rank_score || 1) });
+  } catch (err) {
+    console.error('Creator points failed:', err.message);
+    creatorFail(res, 500, 'Something went wrong. Please try again.');
+  }
+});
 
 // POST /api/creator/verify { code, email, name } -> { ok, creator: { name }, progress }
 app.post('/api/creator/verify', async (req, res) => {
